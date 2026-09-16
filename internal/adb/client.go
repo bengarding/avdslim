@@ -157,6 +157,12 @@ func NewClient() *Client {
 	}
 }
 
+// NewClientWithPath returns a Client that shells out to a specific adb binary.
+// Used by tests to substitute a stub so they need no emulator.
+func NewClientWithPath(adbPath string) *Client {
+	return &Client{adbPath: adbPath}
+}
+
 const (
 	// DefaultExecTimeout bounds an ordinary adb invocation. Without a bound, a
 	// wedged adb server or an unauthorized device leaves the caller blocked
@@ -376,7 +382,9 @@ func (c *Client) Slim(serial string, opts SlimOptions) (int, error) {
 
 	// Trim memory
 	c.Exec("-s", serial, "shell", "am", "kill-all")
-	c.Exec("-s", serial, "shell", "am", "trim-memory", "--all", "COMPLETE")
+	// `am trim-memory` takes a single process, not "--all": the old call was
+	// rejected by activity manager on every run and trimmed nothing. kill-all
+	// above plus the pagecache drop below are what actually reclaim memory.
 	c.Exec("-s", serial, "shell", "su", "0", "sync")
 	c.Exec("-s", serial, "shell", "su", "0", "echo 3 > /proc/sys/vm/drop_caches")
 

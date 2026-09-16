@@ -74,7 +74,18 @@ fetch "checksums.txt" "$WORKDIR/checksums.txt" \
 # ------------------------------------------------------------------------------
 # Verify BEFORE extracting. A tarball is untrusted input until this passes.
 # ------------------------------------------------------------------------------
-EXPECTED="$(awk -v f="$TARBALL" '$2 == f || $2 == "*"f {print $1}' "$WORKDIR/checksums.txt" | head -n 1)"
+# Normalise the filename column before comparing. Different generators emit
+# different decoration for the same file: "name", "./name" (shasum on ./*.glob)
+# and "*name" (sha256sum binary mode) all refer to the same artifact, and a
+# mismatch here would look like a missing checksum entry.
+EXPECTED="$(awk -v f="$TARBALL" '
+  {
+    name = $2
+    sub(/^\.\//, "", name)
+    sub(/^\*/, "", name)
+    if (name == f) { print $1; exit }
+  }
+' "$WORKDIR/checksums.txt")"
 [ -n "$EXPECTED" ] \
   || die "No checksum entry for $TARBALL in checksums.txt. Refusing to install."
 

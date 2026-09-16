@@ -69,7 +69,17 @@ jobs:
             tar -czf "dist/${OUTPUT_NAME}.tar.gz" -C "dist" "${OUTPUT_NAME}"
           done
 
-          ( cd dist && shasum -a 256 ./*.tar.gz > checksums.txt && cat checksums.txt )
+          # Emit BARE filenames, not "./name". install.sh matches the filename
+          # column exactly, so a "./" prefix makes every lookup miss and the
+          # installer refuse to install. The avdslim_ prefix keeps this glob safe
+          # from being read as an option without needing "./".
+          ( cd dist && shasum -a 256 avdslim_*.tar.gz > checksums.txt && cat checksums.txt )
+
+          # Guard the contract between this file and install.sh.
+          if grep -q ' \./' dist/checksums.txt; then
+            echo "::error::checksums.txt contains './'-prefixed filenames; install.sh will not match them"
+            exit 1
+          fi
 
       # Cryptographic provenance tying these artifacts to this repo, commit and
       # workflow. checksums.txt alone only proves the download wasn't corrupted;

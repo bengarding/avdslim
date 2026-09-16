@@ -536,14 +536,25 @@ func handleLaunch(client *adb.Client, args []string) {
 
 	if doSlim {
 		fmt.Println("⏳ Waiting for emulator to finish booting...")
-		_, _ = client.Exec("wait-for-device")
 
+		// Every adb call here must name the device. Without -s, adb fails with
+		// "more than one device/emulator" whenever another emulator is already
+		// running, so getprop never returned 1, the loop always ran its full
+		// 120s and reported a bogus timeout, and the follow-up handleOn could not
+		// resolve a device either. `avdslim start` was broken outright for anyone
+		// with a second emulator open.
 		booted := false
+		serial := ""
 		for i := 0; i < 60; i++ {
-			res, _ := client.Exec("shell", "getprop", "sys.boot_completed")
-			if strings.TrimSpace(res) == "1" {
-				booted = true
-				break
+			if serial == "" {
+				serial = findSerialForAvd(client, avdName)
+			}
+			if serial != "" {
+				res, _ := client.Exec("-s", serial, "shell", "getprop", "sys.boot_completed")
+				if strings.TrimSpace(res) == "1" {
+					booted = true
+					break
+				}
 			}
 			time.Sleep(2 * time.Second)
 		}
@@ -552,18 +563,62 @@ func handleLaunch(client *adb.Client, args []string) {
 			// Forward the slim-related flags. Passing nil here dropped
 			// --aggressive/--keep=/--disable-animations, so `start --aggressive`
 			// silently applied the Standard preset instead.
-			slimArgs := slimFlagsFrom(options)
+			slimArgs := append([]string{serial}, slimFlagsFrom(options)...)
 			if hasGolden && !forceCold {
 				fmt.Println("✓ Instant boot complete via Golden Snapshot! Refreshing slim state...")
-				handleOn(client, slimArgs)
 			} else {
 				fmt.Println("✓ Boot complete! Applying avdslim optimizations...")
-				handleOn(client, slimArgs)
 			}
+			handleOn(client, slimArgs)
 		} else {
 			fmt.Println("⚠️  Boot timed out after 120s. You can run `avdslim on` manually.")
 		}
 	}
+}
+
+// findSerialForAvd returns the serial of the running emulator hosting avdName,
+// or "" if none is up yet. Used instead of bare adb calls so a second running
+// emulator cannot make adb ambiguous.
+func findSerialForAvd(client *adb.Client, avdName string) string {
+	running, err := client.GetRunningEmulators()
+	if err != nil {
+		return ""
+	}
+	for _, emu := range running {
+		if client.IsAvd(emu.Serial, avdName) {
+			return emu.Serial
+		}
+	}
+	return ""
+}
+
+// waitForEmulatorGone polls adb until serial disappears from the device list,
+// which is authoritative. Returns false if it is still present when time runs
+// out, so callers can report honestly instead of claiming a clean shutdown.
+//
+// The previous loops polled host.FindHostPidForSerial and broke as soon as it
+// returned 0 — which it also does when it simply cannot identify the process
+// (no lsof, or several emulators running), making "stopped cleanly" print
+// immediately whether or not anything had stopped.
+func waitForEmulatorGone(client *adb.Client, serial string, attempts int) bool {
+	for i := 0; i < attempts; i++ {
+		time.Sleep(1 * time.Second)
+		running, err := client.GetRunningEmulators()
+		if err != nil {
+			continue
+		}
+		present := false
+		for _, emu := range running {
+			if emu.Serial == serial {
+				present = true
+				break
+			}
+		}
+		if !present {
+			return true
+		}
+	}
+	return false
 }
 
 func handleStop(client *adb.Client, args []string) {
@@ -632,13 +687,11 @@ func handleStop(client *adb.Client, args []string) {
 	fmt.Printf("🛑 Gracefully shutting down %s (%s)...\n", serial, avdName)
 	client.Exec("-s", serial, "emu", "kill")
 
-	for i := 0; i < 10; i++ {
-		time.Sleep(1 * time.Second)
-		if pid := host.FindHostPidForSerial(serial); pid == 0 {
-			break
-		}
+	if waitForEmulatorGone(client, serial, 15) {
+		fmt.Println("✓ Emulator process stopped cleanly.")
+	} else {
+		fmt.Printf("⚠️  %s is still listed by adb after 15s; it may be shutting down slowly.\n", serial)
 	}
-	fmt.Println("✓ Emulator process stopped cleanly.")
 	fmt.Println()
 }
 
@@ -664,13 +717,11 @@ func handleRestart(client *adb.Client, args []string) {
 	fmt.Printf("🔄 Gracefully shutting down %s (%s)...\n", serial, avdName)
 	client.Exec("-s", serial, "emu", "kill")
 
-	for i := 0; i < 10; i++ {
-		time.Sleep(1 * time.Second)
-		if pid := host.FindHostPidForSerial(serial); pid == 0 {
-			break
-		}
+	if waitForEmulatorGone(client, serial, 15) {
+		fmt.Println("✓ Emulator process stopped.")
+	} else {
+		fmt.Printf("⚠️  %s is still listed by adb after 15s; relaunching anyway may fail.\n", serial)
 	}
-	fmt.Println("✓ Emulator process stopped.")
 
 	// Purge only the stale runtime cache. `restart` used to os.RemoveAll the
 	// entire snapshots/ directory, destroying every snapshot for this AVD —
@@ -996,8 +1047,11 @@ func handleBake(client *adb.Client, args []string) {
 	}
 
 	fmt.Printf("✓ Emulator spawned (PID: %d). Waiting for boot completion...\n", cmd.Process.Pid)
-	_, _ = client.Exec("wait-for-device")
 
+	// No bare `adb wait-for-device` here: without -s it waits for *any* device, so
+	// it returns instantly when an unrelated emulator is already running, and it
+	// can block for the full blocking timeout when none appears. The loop below
+	// identifies this AVD's own serial and is bounded at 180s.
 	// Wait for sys.boot_completed
 	var targetSerial string
 	booted := false
@@ -1069,13 +1123,11 @@ func handleBake(client *adb.Client, args []string) {
 	fmt.Println("🛑 Gracefully shutting down baking emulator...")
 	client.Exec("-s", targetSerial, "emu", "kill")
 
-	for i := 0; i < 10; i++ {
-		time.Sleep(1 * time.Second)
-		if pid := host.FindHostPidForSerial(targetSerial); pid == 0 {
-			break
-		}
+	if waitForEmulatorGone(client, targetSerial, 15) {
+		fmt.Println("✓ Emulator shut down cleanly.")
+	} else {
+		fmt.Printf("⚠️  %s is still listed by adb after 15s.\n", targetSerial)
 	}
-	fmt.Println("✓ Emulator shut down cleanly.")
 
 	fmt.Println()
 	fmt.Println("════════════════════════════════════════════════════════════════════════")

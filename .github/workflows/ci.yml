@@ -96,4 +96,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - run: shellcheck install.sh scripts/monitor-pull.sh
+      - run: shellcheck install.sh scripts/monitor-pull.sh scripts/test-checksum-lookup.sh
+
+      # Guards the contract between the checksums.txt release.yml writes and the
+      # filename column install.sh matches against. A "./" prefix once made every
+      # lookup miss, which would have refused to install every future release.
+      - name: checksums.txt / install.sh contract
+        run: ./scripts/test-checksum-lookup.sh

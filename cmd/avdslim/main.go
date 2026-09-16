@@ -316,7 +316,7 @@ func handleOn(client *adb.Client, args []string) {
 	}
 
 	fmt.Println("══════════════════════════════════════════════════════════════")
-	fmt.Printf("🎉 Slimming complete for %s!\n", serial)
+	fmt.Printf("🎉 Guest slimming complete for %s!\n", serial)
 	if beforeFootprint > 0 && afterFootprint > 0 {
 		// Report the signed change. Clamping negatives to zero and labelling the
 		// result "Reclaimed: 0MB" presented a memory *increase* as a neutral
@@ -325,11 +325,48 @@ func handleOn(client *adb.Client, args []string) {
 			beforeFootprint, afterFootprint, describeDelta(beforeFootprint, afterFootprint))
 		fmt.Printf("🖥️  Host Resident RAM (RSS): %dMB -> %dMB (%s)\n",
 			beforeRss, afterRss, describeDelta(beforeRss, afterRss))
-		fmt.Println("   ⚠️  Measured seconds after slimming, while the guest is still")
-		fmt.Println("      restarting services, so it usually reads high. Re-run")
-		fmt.Println("      `avdslim measure` once the emulator settles.")
+		fmt.Println("   Measured seconds after slimming, while the guest is still")
+		fmt.Println("   restarting services, so it usually reads high.")
 	}
-	fmt.Printf("ℹ️  To restore default stock services anytime:\n   avdslim off %s\n\n", serial)
+
+	// The headline "8GB -> 1.5GB" number comes from launching with -memory /
+	// -lowram / -gpu, none of which `on` can do: QEMU sizes the guest's RAM and
+	// its GPU buffers once, at startup. `on` only changes the guest — packages,
+	// settings, caches — so expecting Activity Monitor to drop after running it
+	// leads to exactly the "it's still showing 6.8GB" confusion.
+	fmt.Println()
+	fmt.Println("ℹ️  This reduced work INSIDE the guest, not the host process size.")
+	fmt.Println("   Activity Monitor reflects flags QEMU was started with (-memory,")
+	fmt.Println("   -lowram, -gpu), which cannot change while the emulator runs.")
+	if !launchedByAvdslim(hostPid) {
+		fmt.Println()
+		fmt.Println("   This emulator was NOT started with low-memory flags. To actually")
+		fmt.Println("   cut host RAM you have to relaunch it:")
+		if avdName, err := client.GetAvdName(serial); err == nil && avdName != "" {
+			fmt.Printf("     avdslim tune-avd %s --ram=1024   # persist RAM + GPU in config.ini\n", avdName)
+			fmt.Printf("     avdslim restart %s               # relaunch with those flags\n", serial)
+		} else {
+			fmt.Println("     avdslim tune-avd <avd> --ram=1024")
+			fmt.Println("     avdslim restart")
+		}
+		fmt.Println("   Or run `avdslim install-shim` so Android Studio's Play button")
+		fmt.Println("   launches with them automatically.")
+	}
+	fmt.Printf("\nℹ️  To restore default stock services anytime:\n   avdslim off %s\n\n", serial)
+}
+
+// launchedByAvdslim reports whether the emulator process was started with the
+// low-memory flags, so `on` can tell the user whether a relaunch is what they
+// actually need.
+func launchedByAvdslim(hostPid int) bool {
+	if hostPid <= 0 {
+		return false
+	}
+	out, err := host.RunProbe("ps", "-p", strconv.Itoa(hostPid), "-o", "command=")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "-lowram")
 }
 
 func handleOff(client *adb.Client, args []string) {

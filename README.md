@@ -100,6 +100,33 @@ Just like `simslim` silences iOS simulators via `launchctl`, `avdslim`:
 5. **Limits Background Churn**: Caps `background_process_limit = 4` (protecting OAuth and biometrics) and disables auto-sync.
 6. **Drops Caches**: Flushes Linux page caches and compacts memory heaps.
 
+> ### ⚠️ Which of those actually shrinks Activity Monitor
+>
+> **Only 1 and 2 — and only at launch.** QEMU sizes the guest's RAM and its GPU
+> buffers once, when the emulator starts. Steps 3–6 are what `avdslim on` does,
+> and they all happen *inside* the guest: disabling packages, changing settings,
+> dropping caches. They reduce CPU wakeups and guest memory pressure, but they
+> **cannot change the size of the host `qemu-system` process**.
+>
+> So if you start an emulator from Android Studio's Play button and then run
+> `avdslim on`, Activity Monitor will *not* drop. That is expected, not a bug.
+> Measured on one machine, same AVD:
+>
+> | How it was launched | Activity Monitor footprint |
+> | :--- | :--- |
+> | Android Studio Play button (no flags) | **~6.9 GB** |
+> | `avdslim start` (`-memory 1024 -lowram -gpu host`) | **~2.6 GB** |
+>
+> To actually cut host RAM you have to relaunch:
+>
+> ```bash
+> avdslim tune-avd <avd> --ram=1024   # persist RAM + GPU mode in config.ini
+> avdslim restart                     # relaunch with those flags
+> ```
+>
+> Or `avdslim install-shim` once, so Android Studio's Play button launches with
+> the flags automatically.
+
 ---
 
 ## 📊 Memory Footprint Breakdown

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -119,27 +120,51 @@ func TuneAvd(targetAvd string, ramMb, heapMb int, gpuMode string) error {
 	kv["fastboot.forceColdBoot"] = "yes"
 	kv["fastboot.forceFastBoot"] = "no"
 
+	// Write keys in sorted order. Ranging over a Go map is randomised, so the
+	// previous version rewrote config.ini in a different order every run, making
+	// diffs and backups useless for spotting what actually changed.
+	keys := make([]string, 0, len(kv))
+	for k := range kv {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
 	var sb strings.Builder
-	for k, v := range kv {
-		sb.WriteString(fmt.Sprintf("%s=%s\n", k, v))
+	for _, k := range keys {
+		sb.WriteString(fmt.Sprintf("%s=%s\n", k, kv[k]))
 	}
 
 	if err := os.WriteFile(fileToTune, []byte(sb.String()), 0644); err != nil {
 		return err
 	}
 
-	// Purge stale runtime ini and snapshots to prevent restoring previous 4GB/lavapipe states
+	// Purge the stale runtime ini so the emulator does not restore the previous
+	// hardware config. This is the file that actually carries the old RAM/GPU
+	// values forward.
+	//
+	// Snapshots are deliberately NOT deleted here. Doing so destroyed every
+	// snapshot for the AVD, including ones the user created themselves, with no
+	// prompt and no way back. They are merely stale, not harmful: a snapshot
+	// taken under the old RAM size will be rejected or cold-booted by QEMU.
 	avdDir := filepath.Dir(fileToTune)
 	_ = os.Remove(filepath.Join(avdDir, "hardware-qemu.ini"))
 	_ = os.Remove(filepath.Join(avdDir, "hardware-qemu.ini.lock"))
-	_ = os.RemoveAll(filepath.Join(avdDir, "snapshots"))
 
 	fmt.Printf("✅ Successfully tuned AVD %q!\n", avdName)
 	fmt.Printf("   • Host RAM allocated: %d MB (prevents host memory pressure)\n", ramMb)
 	fmt.Printf("   • VM Heap: %d MB\n", heapMb)
 	fmt.Println("   • Hardware Audio & Camera: disabled (saves host threads/buffers)")
 	fmt.Printf("   • GPU Mode: %s (%s)\n", gpuMode, GetGpuBackendDescription(gpuMode))
-	fmt.Println("   • Runtime cache & snapshots: purged (prevents restoring stale 4GB/lavapipe states)")
+	fmt.Println("   • Runtime cache (hardware-qemu.ini): purged")
+
+	// Tell the user their snapshots are now stale rather than silently deleting
+	// them, and hand them the explicit command to remove them if they want.
+	if snaps := listSnapshots(filepath.Join(avdDir, "snapshots")); len(snaps) > 0 {
+		fmt.Printf("   ⚠️  %d existing snapshot(s) were captured under the previous config\n", len(snaps))
+		fmt.Printf("      and may cold-boot instead of restoring: %s\n", strings.Join(snaps, ", "))
+		fmt.Printf("      They have been left in place. To remove avdslim's golden snapshot:\n")
+		fmt.Printf("        avdslim unbake %s\n", avdName)
+	}
 
 	is16K := strings.Contains(kv["tag.id"], "page_size_16kb") || strings.Contains(kv["image.sysdir.1"], "ps16k") || strings.Contains(kv["image.sysdir.1"], "16kb")
 	isPlayStore := strings.ToLower(kv["PlayStore.enabled"]) == "true" || strings.ToLower(kv["PlayStore.enabled"]) == "yes" || strings.Contains(kv["tag.id"], "playstore")
@@ -156,9 +181,29 @@ func TuneAvd(targetAvd string, ramMb, heapMb int, gpuMode string) error {
 	return nil
 }
 
+// listSnapshots returns the names of snapshot subdirectories, or nil if there
+// are none. Used to warn about stale snapshots instead of deleting them.
+func listSnapshots(snapshotsDir string) []string {
+	entries, err := os.ReadDir(snapshotsDir)
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, e := range entries {
+		// The emulator keeps bookkeeping files alongside snapshot dirs.
+		if e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 func HasGoldenSnapshot(avdName string) bool {
-	avdBase := GetAvdBaseDir()
-	snapDir := filepath.Join(avdBase, avdName+".avd", "snapshots", "avdslim_clean")
+	snapDir, err := SnapshotDir(avdName, GoldenSnapshotName)
+	if err != nil {
+		return false
+	}
 	info, err := os.Stat(snapDir)
 	return err == nil && info.IsDir()
 }

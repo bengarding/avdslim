@@ -625,13 +625,20 @@ func handleRestart(client *adb.Client, args []string) {
 	}
 	fmt.Println("✓ Emulator process stopped.")
 
-	// Purge stale runtime cache & snapshots
-	home, _ := os.UserHomeDir()
-	avdDir := filepath.Join(home, ".android", "avd", avdName+".avd")
+	// Purge only the stale runtime cache. `restart` used to os.RemoveAll the
+	// entire snapshots/ directory, destroying every snapshot for this AVD —
+	// including ones the user took themselves, and the golden snapshot that
+	// `stop --snap` had just offered to create — with no prompt and no undo.
+	// avdName here comes from emulator console output, so it is validated
+	// before being turned into a path.
+	avdDir, err := config.AvdDir(avdName)
+	if err != nil {
+		fmt.Printf("❌ %v\n", err)
+		return
+	}
 	_ = os.Remove(filepath.Join(avdDir, "hardware-qemu.ini"))
 	_ = os.Remove(filepath.Join(avdDir, "hardware-qemu.ini.lock"))
-	_ = os.RemoveAll(filepath.Join(avdDir, "snapshots"))
-	fmt.Println("✓ Purged stale hardware-qemu.ini and snapshots.")
+	fmt.Println("✓ Purged stale hardware-qemu.ini (snapshots left intact).")
 
 	launchArgs := []string{avdName, "--slim"}
 	for _, a := range args {
@@ -881,9 +888,14 @@ func handleBake(client *adb.Client, args []string) {
 		}
 	}
 
-	// Clean existing snapshot directory
-	home, _ := os.UserHomeDir()
-	snapDir := filepath.Join(home, ".android", "avd", targetAvd+".avd", "snapshots", "avdslim_clean")
+	// Clean only avdslim's own golden snapshot, which we are about to replace.
+	// Scoped to that one directory, never the whole snapshots/ tree, and the
+	// AVD name is validated before it becomes a path.
+	snapDir, err := config.SnapshotDir(targetAvd, config.GoldenSnapshotName)
+	if err != nil {
+		fmt.Printf("❌ %v\n", err)
+		return
+	}
 	_ = os.RemoveAll(snapDir)
 
 	// 2. Launch cold emulator (DO NOT pass -no-snapshot-save, DO pass -no-snapshot-load)
@@ -1012,7 +1024,7 @@ func handleSnapshot(client *adb.Client, args []string) {
 	var serial string
 	skipSlim := false
 	aggressive := false
-	snapName := "avdslim_clean"
+	snapName := config.GoldenSnapshotName
 	var keepPackages []string
 
 	for _, a := range args {
@@ -1034,6 +1046,13 @@ func handleSnapshot(client *adb.Client, args []string) {
 		} else if !strings.HasPrefix(a, "--") {
 			serial = a
 		}
+	}
+
+	// snapName is user-supplied via --tag=/--name= and ends up both as a
+	// directory name and as an argument to the emulator console.
+	if err := config.ValidateSnapshotName(snapName); err != nil {
+		fmt.Printf("❌ %v\n", err)
+		return
 	}
 
 	running, err := client.GetRunningEmulators()
@@ -1128,9 +1147,15 @@ func handleUnbake(args []string) {
 		return
 	}
 
-	home, _ := os.UserHomeDir()
-	snapDir := filepath.Join(home, ".android", "avd", targetAvd+".avd", "snapshots", "avdslim_clean")
-	if _, err := os.Stat(snapDir); os.IsNotExist(err) {
+	// targetAvd comes straight from argv, so validate it before it reaches
+	// os.RemoveAll. `avdslim unbake ../../../../tmp/x` previously resolved
+	// outside the AVD tree entirely.
+	snapDir, err := config.SnapshotDir(targetAvd, config.GoldenSnapshotName)
+	if err != nil {
+		fmt.Printf("❌ %v\n", err)
+		return
+	}
+	if _, statErr := os.Stat(snapDir); os.IsNotExist(statErr) {
 		fmt.Printf("ℹ️  No Golden Snapshot found for %s.\n", targetAvd)
 		return
 	}
@@ -1144,4 +1169,3 @@ func handleUnbake(args []string) {
 	fmt.Println("   Subsequent launches will perform standard boots.")
 	fmt.Println()
 }
-

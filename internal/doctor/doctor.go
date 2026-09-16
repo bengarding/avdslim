@@ -118,9 +118,9 @@ func RunDoctor(client *adb.Client) {
 
 			// Check Golden Snapshot
 			if config.HasGoldenSnapshot(name) {
-				fmt.Println("     ✨ Golden Snapshot: Baked ('avdslim_clean' ~1.5s instant boot ready)")
+				fmt.Println("     ✨ Golden Snapshot: Baked ('avdslim_clean' — launches resume it instead of cold-booting)")
 			} else {
-				fmt.Printf("     ℹ️  Golden Snapshot: None (Run `avdslim bake %s` for ~1.5s instant boot)\n", name)
+				fmt.Printf("     ℹ️  Golden Snapshot: None (Run `avdslim bake %s` to skip cold boots)\n", name)
 			}
 		}
 		fmt.Println()

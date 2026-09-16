@@ -213,7 +213,7 @@ avdslim bench
 
 ---
 
-### 3. Golden Snapshot: ~1.5-Second Instant Boot (`bake`)
+### 3. Golden Snapshot: Skip the Cold Boot (`bake`)
 Cold booting Android emulators typically takes 35–60 seconds. `avdslim bake` cold boots your emulator once, applies all bloat pruning and memory optimizations, and saves an immutable `avdslim_clean` snapshot:
 ```bash
 avdslim bake
@@ -222,7 +222,7 @@ avdslim bake Pixel_10_Pro
 # Headless baking (for CI or background):
 avdslim bake 1 --headless
 ```
-* **~1.5s instant restore**: Subsequent launches (`avdslim start` or Android Studio via shim) restore from the clean snapshot in < 2 seconds.
+* **Skips the cold boot**: subsequent launches (`avdslim start`, or Android Studio via the shim) resume the saved RAM image instead of booting Android from scratch. QEMU's snapshot load itself is a second or two; `avdslim start` end-to-end is longer, because it also waits for `sys.boot_completed` and re-applies the slim pass. Measured on one machine: ~46s to bake cold, ~13s for a subsequent `avdslim start`.
 * **Ephemeral safety (`-no-snapshot-save`)**: Dev sessions never pollute the snapshot. Every reboot starts 100% clean and slimmed.
 
 ---
@@ -237,7 +237,7 @@ avdslim snapshot
 # Or alias:
 avdslim bake --live
 ```
-Now, every future launch restores your pre-installed apps and credentials instantly in **< 1.5s**!
+Now every future launch resumes your pre-installed apps and credentials from the saved image instead of cold-booting.
 
 ---
 
@@ -337,7 +337,7 @@ avdslim restart emulator-5554 --ram=1024
 ---
 
 ### 12. Start / Launch Emulator (`start`, `run`, `launch`)
-Starts an AVD with low-memory host flags and auto-slims upon boot. If a Golden Snapshot exists, it boots in **<1.5s** automatically:
+Starts an AVD with low-memory host flags and auto-slims upon boot. If a Golden Snapshot exists, it resumes from that image instead of cold-booting:
 ```bash
 # Interactive numbered menu (press 1, 2, or hit Enter for default)
 avdslim start

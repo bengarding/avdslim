@@ -110,10 +110,10 @@ Commands:
   start, run, launch [avd] Launch AVD with low-memory host flags & auto-slim upon boot
                        Options: --no-slim, --no-lowram, --headless, --cold, --ram=<MB> (default: 1024)
   stop, kill [device]  Gracefully shut down emulator (Options: --snap, -f)
-  bake [avd_name]      Create local Golden Snapshot (pruned & slimmed) for ~1.5s instant boots
+  bake [avd_name]      Create local Golden Snapshot (pruned & slimmed) to skip cold boots
                        Options: --ram=<MB> (default: 1024), --aggressive, --headless, --live
   snapshot, snap       Capture running emulator (with pre-installed apps & test logins)
-                       into Golden Snapshot for instant <1.5s restores
+                       into a Golden Snapshot to resume from later
   unbake [avd_name]    Delete Golden Snapshot and return AVD to stock cold boots
   bench [device]       Show measured current memory state (not a before/after
                        comparison — use 'measure' before and after 'on' for that)
@@ -532,7 +532,7 @@ func handleLaunch(client *adb.Client, args []string) {
 	hasGolden := config.HasGoldenSnapshot(avdName)
 	if hasGolden && !forceCold {
 		emuArgs = append(emuArgs, "-snapshot", "avdslim_clean", "-no-snapshot-save")
-		fmt.Printf("✨ Golden Snapshot detected! Restoring instant clean state (< 1.5s boot)...\n")
+		fmt.Printf("✨ Golden Snapshot detected! Resuming the saved clean image instead of cold-booting...\n")
 	} else {
 		emuArgs = append(emuArgs, "-no-snapshot-load")
 	}
@@ -1060,7 +1060,7 @@ func handleBake(client *adb.Client, args []string) {
 	fmt.Printf("🍳 Baking Golden Snapshot for %q (RAM: %d MB)...\n", targetAvd, ramMb)
 	fmt.Println("   • Cold boots emulator in pristine state")
 	fmt.Println("   • Automatically prunes background bloatware & optimizes settings")
-	fmt.Println("   • Captures 'avdslim_clean' snapshot for instant ~1.5s launches")
+	fmt.Println("   • Captures an 'avdslim_clean' snapshot to resume from later")
 	fmt.Println()
 
 	// 1. Check if an emulator for this AVD is already running. If so, kill it to ensure cold boot.
@@ -1188,7 +1188,9 @@ func handleBake(client *adb.Client, args []string) {
 	fmt.Printf(" 🎉 Golden Snapshot Baked Successfully for %s!\n", targetAvd)
 	fmt.Println("════════════════════════════════════════════════════════════════════════")
 	fmt.Println(" • Snapshot Name: 'avdslim_clean'")
-	fmt.Println(" • Startup Latency: Reduced from ~45s cold boot to <1.5s instant restore ⚡")
+	fmt.Println(" • Startup: resumes the saved RAM image instead of cold-booting Android.")
+	fmt.Println("   The snapshot load is a second or two; `avdslim start` end-to-end is")
+	fmt.Println("   longer, since it also waits for boot_completed and re-applies slimming.")
 	fmt.Printf(" • RAM Allocation: %d MB (-lowram)\n", ramMb)
 	fmt.Println(" • How to launch:")
 	fmt.Printf("     avdslim start %s\n", targetAvd)
@@ -1279,7 +1281,7 @@ func handleSnapshot(client *adb.Client, args []string) {
 	fmt.Printf(" • Snapshot Name: %q\n", snapName)
 	fmt.Println(" • Preserved: All installed apps, local databases & logged-in accounts")
 	fmt.Println(" • Instant Restore: Next time you launch with `avdslim start` or Android Studio,")
-	fmt.Println("   it will boot into this exact configured state in < 1.5 seconds! ⚡")
+	fmt.Println("   it will resume this exact configured state instead of cold-booting.")
 	fmt.Println(" • The running emulator remains active for your current work.")
 	fmt.Println("════════════════════════════════════════════════════════════════════════")
 	fmt.Println()

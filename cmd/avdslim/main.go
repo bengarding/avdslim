@@ -93,9 +93,14 @@ Commands:
   on [device]          Slim down emulator: disable bloat daemons & trim RAM
                        Options: --aggressive (also disables Play Store updater)
                                 --keep=<package> (preserve specific package, e.g. Maps)
-  restore, off         Instant 100%% stock restore (re-enables packages, animations & sync)
+                                --disable-animations (opt-in; zeroes animation
+                                  scales — affects UI-test timing, off by default)
+  restore, off         Revert what avdslim changed: re-enable the packages it
+                       disabled and put settings back to their recorded values
+                       (requires the state file written by 'on')
   watch                Auto-detect & slim new emulators as soon as they boot
-                       Options: --aggressive, --keep=<package>
+                       Options: --aggressive, --keep=<package>, --disable-animations
+                       ⚠️  Modifies every emulator that boots, incl. under test
   tune-avd [avd_name]  Tune host AVD config.ini (RAM=1024M, Metal GPU, no cameras)
                        Options: --ram=<MB> (default: 1024), --heap=<MB> (default: 256)
   start, run, launch [avd] Launch AVD with low-memory host flags & auto-slim upon boot
@@ -121,6 +126,7 @@ Examples:
   avdslim measure
   avdslim on --aggressive
   avdslim on --keep=com.google.android.apps.maps
+  avdslim on --disable-animations
   avdslim tune-avd Pixel_10_Pro --ram=1024
   avdslim restart
 `, version)
@@ -207,37 +213,70 @@ func handleMeasure(client *adb.Client, args []string) {
 	host.PrintGuestMeminfo(out)
 }
 
-func handleOn(client *adb.Client, args []string) {
-	aggressive := false
-	filteredArgs := make([]string, 0, len(args))
-	var keepPackages []string
+// parseSlimOptions extracts the flags controlling what Slim changes on a guest.
+// Shared by on/watch/launch/bake/snapshot so a flag means the same thing
+// everywhere.
+func parseSlimOptions(args []string) adb.SlimOptions {
+	var opts adb.SlimOptions
 	for _, a := range args {
-		if a == "--aggressive" {
-			aggressive = true
-		} else if strings.HasPrefix(a, "--keep=") {
-			pkg := strings.TrimPrefix(a, "--keep=")
-			if pkg != "" {
-				keepPackages = append(keepPackages, pkg)
+		switch {
+		case a == "--aggressive":
+			opts.Aggressive = true
+		case a == "--disable-animations" || a == "--no-animations":
+			opts.DisableAnimations = true
+		case strings.HasPrefix(a, "--keep="):
+			if pkg := strings.TrimPrefix(a, "--keep="); pkg != "" {
+				opts.KeepPackages = append(opts.KeepPackages, pkg)
 			}
-		} else {
-			filteredArgs = append(filteredArgs, a)
 		}
 	}
+	return opts
+}
 
-	serial, err := client.ResolveDevice(filteredArgs)
+// slimFlagsFrom keeps only the flags that Slim cares about, so a parent command
+// can forward them to handleOn without leaking its own flags (--ram=, --cold…).
+func slimFlagsFrom(args []string) []string {
+	var out []string
+	for _, a := range args {
+		switch {
+		case a == "--aggressive",
+			a == "--disable-animations",
+			a == "--no-animations",
+			strings.HasPrefix(a, "--keep="):
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// positionalArgs drops flags, leaving device serials / AVD names.
+func positionalArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func handleOn(client *adb.Client, args []string) {
+	opts := parseSlimOptions(args)
+
+	serial, err := client.ResolveDevice(positionalArgs(args))
 	if err != nil {
 		fmt.Printf("❌ %v\n", err)
 		return
 	}
 
 	presetName := "Standard"
-	if aggressive {
+	if opts.Aggressive {
 		presetName = "Aggressive"
 	}
 	fmt.Printf("⚡ Slimming Android Emulator (%s) [preset: %s]...\n\n", serial, presetName)
 
-	if len(keepPackages) > 0 {
-		fmt.Printf("   Preserving requested package(s): %s\n", strings.Join(keepPackages, ", "))
+	if len(opts.KeepPackages) > 0 {
+		fmt.Printf("   Preserving requested package(s): %s\n", strings.Join(opts.KeepPackages, ", "))
 	}
 
 	hostPid := host.FindHostPidForSerial(serial)
@@ -249,10 +288,14 @@ func handleOn(client *adb.Client, args []string) {
 	}
 
 	fmt.Println("1. Disabling non-essential background daemons:")
-	count, _ := client.Slim(serial, aggressive, keepPackages)
+	count, _ := client.Slim(serial, opts)
 	fmt.Printf("   -> Successfully disabled %d packages.\n\n", count)
 
-	fmt.Println("2. Tuned system settings (animations 0x, background limit 4, sync off).")
+	if opts.DisableAnimations {
+		fmt.Println("2. Tuned system settings (animations 0x, background limit 4, sync off).")
+	} else {
+		fmt.Println("2. Tuned system settings (background limit 4, sync off; animations left alone).")
+	}
 	fmt.Println("3. Purged cached processes and trimmed memory.")
 	fmt.Println()
 
@@ -499,12 +542,16 @@ func handleLaunch(client *adb.Client, args []string) {
 		}
 
 		if booted {
+			// Forward the slim-related flags. Passing nil here dropped
+			// --aggressive/--keep=/--disable-animations, so `start --aggressive`
+			// silently applied the Standard preset instead.
+			slimArgs := slimFlagsFrom(options)
 			if hasGolden && !forceCold {
 				fmt.Println("✓ Instant boot complete via Golden Snapshot! Refreshing slim state...")
-				handleOn(client, nil)
+				handleOn(client, slimArgs)
 			} else {
 				fmt.Println("✓ Boot complete! Applying avdslim optimizations...")
-				handleOn(client, nil)
+				handleOn(client, slimArgs)
 			}
 		} else {
 			fmt.Println("⚠️  Boot timed out after 120s. You can run `avdslim on` manually.")
@@ -654,31 +701,24 @@ func findEmulator() string {
 }
 
 func handleWatch(client *adb.Client, args []string) {
-	aggressive := false
-	var keepPackages []string
-	for _, a := range args {
-		if a == "--aggressive" {
-			aggressive = true
-		} else if strings.HasPrefix(a, "--keep=") {
-			pkg := strings.TrimPrefix(a, "--keep=")
-			if pkg != "" {
-				keepPackages = append(keepPackages, pkg)
-			}
-		}
-	}
+	opts := parseSlimOptions(args)
 
 	preset := "Standard"
-	if aggressive {
+	if opts.Aggressive {
 		preset = "Aggressive"
 	}
 
 	fmt.Println("👀 AVD-SLIM Watcher active...")
 	fmt.Printf("   Preset: %s\n", preset)
-	if len(keepPackages) > 0 {
-		fmt.Printf("   Preserving packages: %s\n", strings.Join(keepPackages, ", "))
+	if len(opts.KeepPackages) > 0 {
+		fmt.Printf("   Preserving packages: %s\n", strings.Join(opts.KeepPackages, ", "))
+	}
+	if opts.DisableAnimations {
+		fmt.Println("   Animations: will be disabled on each emulator")
 	}
 	fmt.Println("   Monitoring for newly booted Android emulators in the background.")
 	fmt.Println("   Will automatically apply low-memory optimizations as soon as emulators boot.")
+	fmt.Println("   ⚠️  This modifies EVERY emulator that boots, including ones under test.")
 	fmt.Println("   Press Ctrl+C to stop.")
 	fmt.Println()
 
@@ -725,7 +765,7 @@ func handleWatch(client *adb.Client, args []string) {
 				}
 
 				fmt.Printf("\n✨ [%s] Emulator booted! Automatically applying avdslim...\n", emu.Serial)
-				count, _ := client.Slim(emu.Serial, aggressive, keepPackages)
+				count, _ := client.Slim(emu.Serial, opts)
 				fmt.Printf("✓ [%s] Successfully slimmed! Disabled %d packages, trimmed RAM.\n\n", emu.Serial, count)
 				slimmedDevices[emu.Serial] = true
 			}
@@ -758,32 +798,60 @@ func handleBench(client *adb.Client, args []string) {
 		}
 	}
 
-	baselineFp := 5600
-	baselineRss := 2800
-
-	fpSavingPct := 0
-	if footprintMb > 0 && footprintMb < baselineFp {
-		fpSavingPct = int(((float64(baselineFp) - float64(footprintMb)) / float64(baselineFp)) * 100)
+	// Read the values actually in effect rather than asserting them. The previous
+	// version compared against hardcoded 5600/2800 MB "stock baseline" constants
+	// and printed a fixed "-50%" heap row and a "0x animations" row regardless of
+	// the device's real state, so the headline savings figure was computed against
+	// a number that was never measured.
+	animScale := strings.TrimSpace(mustGetSetting(client, serial, "global", "window_animation_scale"))
+	if animScale == "" || animScale == "null" {
+		animScale = "1.0 (default)"
 	}
-	rssSavingPct := 0
-	if rssMb > 0 && rssMb < baselineRss {
-		rssSavingPct = int(((float64(baselineRss) - float64(rssMb)) / float64(baselineRss)) * 100)
+	heapMb := "unknown"
+	for _, avd := range config.GetInstalledAvds() {
+		if v := avd["vm.heapSize"]; v != "" {
+			heapMb = v + " MB"
+			break
+		}
+	}
+	ramCfg := "unknown"
+	for _, avd := range config.GetInstalledAvds() {
+		if v := avd["hw.ramSize"]; v != "" {
+			ramCfg = v + " MB"
+			break
+		}
 	}
 
 	fmt.Printf(`════════════════════════════════════════════════════════════════════════
- ⚡ AVD-SLIM Live Efficiency Scoreboard: %s
+ ⚡ AVD-SLIM Measured State: %s
 ════════════════════════════════════════════════════════════════════════
- Metric                      Stock Baseline    AVD-SLIM (Current)   Savings
- ───────────────────────────────────────────────────────────────────────
- Host Memory (Footprint)     5,600 MB (5.6 GB) %5d MB (%3.1f GB)   -%d%% ⚡
- Physical Resident RAM (RSS) 2,800 MB (2.8 GB) %5d MB (%3.1f GB)   -%d%% ⚡
- Disabled Background Bloat   0 packages        %2d packages disabled
- Dalvik / ART Heap Ceiling   512 MB            256 MB (Compact)    -50%%
- Display Animations / Churn  1.0x Scale        0x (Zero GPU Churn)  100%%
- ───────────────────────────────────────────────────────────────────────
- 🛡️  Fidelity: 100%% FCM Push, Firebase Auth, WebView & Sockets Guaranteed
+ Host memory (Activity Monitor footprint)  %d MB (%.1f GB)
+ Host resident physical RAM (RSS)          %d MB (%.1f GB)
+ Disabled packages on device               %d
+ Configured guest RAM (config.ini)         %s
+ Configured Dalvik/ART heap (config.ini)   %s
+ window_animation_scale                    %s
 ════════════════════════════════════════════════════════════════════════
-`, serial, footprintMb, float64(footprintMb)/1024.0, fpSavingPct, rssMb, float64(rssMb)/1024.0, rssSavingPct, disabledCount)
+ These are measurements of the current state, not a before/after comparison.
+ To measure savings, run 'avdslim measure' before and after 'avdslim on'.
+`, serial,
+		footprintMb, float64(footprintMb)/1024.0,
+		rssMb, float64(rssMb)/1024.0,
+		disabledCount, ramCfg, heapMb, animScale)
+
+	if disabledCount == 0 {
+		fmt.Println(" ℹ️  No disabled packages found — this emulator looks un-slimmed.")
+	}
+	fmt.Println()
+}
+
+// mustGetSetting reads a guest setting for display, returning "" on failure.
+func mustGetSetting(client *adb.Client, serial, namespace, key string) string {
+	out, err := client.Exec("-s", serial, "shell", "settings", "get", namespace, key)
+	if err != nil {
+		return ""
+	}
+	return out
 }
 
 func handleInstallShim(args []string) {
@@ -831,24 +899,16 @@ func handleBake(client *adb.Client, args []string) {
 	installed := config.GetInstalledAvds()
 	var targetAvd string
 	ramMb := 1024
-	aggressive := false
 	headless := false
-	var keepPackages []string
+	opts := parseSlimOptions(args)
 
 	for _, a := range args {
 		if strings.HasPrefix(a, "--ram=") {
 			if v, err := strconv.Atoi(strings.TrimPrefix(a, "--ram=")); err == nil {
 				ramMb = v
 			}
-		} else if a == "--aggressive" {
-			aggressive = true
 		} else if a == "--headless" || a == "--no-window" {
 			headless = true
-		} else if strings.HasPrefix(a, "--keep=") {
-			pkg := strings.TrimPrefix(a, "--keep=")
-			if pkg != "" {
-				keepPackages = append(keepPackages, pkg)
-			}
 		} else if !strings.HasPrefix(a, "--") {
 			targetAvd = a
 		}
@@ -968,7 +1028,7 @@ func handleBake(client *adb.Client, args []string) {
 
 	// 3. Apply avdslim optimizations
 	fmt.Println("⚡ Pruning bloatware & tuning runtime settings...")
-	count, err := client.Slim(targetSerial, aggressive, keepPackages)
+	count, err := client.Slim(targetSerial, opts)
 	if err != nil {
 		fmt.Printf("⚠️  Warning during slim: %v\n", err)
 	} else {
@@ -1023,26 +1083,18 @@ func handleBake(client *adb.Client, args []string) {
 func handleSnapshot(client *adb.Client, args []string) {
 	var serial string
 	skipSlim := false
-	aggressive := false
 	snapName := config.GoldenSnapshotName
-	var keepPackages []string
+	opts := parseSlimOptions(args)
 
 	for _, a := range args {
 		if a == "--skip-slim" || a == "--no-prune" {
 			skipSlim = true
-		} else if a == "--aggressive" {
-			aggressive = true
 		} else if a == "--live" || a == "--current" {
 			// standard flag alias, ignore
 		} else if strings.HasPrefix(a, "--tag=") {
 			snapName = strings.TrimPrefix(a, "--tag=")
 		} else if strings.HasPrefix(a, "--name=") {
 			snapName = strings.TrimPrefix(a, "--name=")
-		} else if strings.HasPrefix(a, "--keep=") {
-			pkg := strings.TrimPrefix(a, "--keep=")
-			if pkg != "" {
-				keepPackages = append(keepPackages, pkg)
-			}
 		} else if !strings.HasPrefix(a, "--") {
 			serial = a
 		}
@@ -1092,7 +1144,7 @@ func handleSnapshot(client *adb.Client, args []string) {
 	fmt.Printf("📸 Capturing Golden Snapshot from live emulator %s (%s)...\n", serial, avdName)
 	if !skipSlim {
 		fmt.Println("⚡ Trimming background daemons and caches while preserving installed apps...")
-		count, _ := client.Slim(serial, aggressive, keepPackages)
+		count, _ := client.Slim(serial, opts)
 		fmt.Printf("✓ Trimmed memory and disabled %d background bloat packages.\n", count)
 	}
 

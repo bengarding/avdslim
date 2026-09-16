@@ -2,6 +2,7 @@ package adb
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -28,6 +29,95 @@ type SlimState struct {
 	Timestamp        string   `json:"timestamp"`
 	DisabledPackages []string `json:"disabled_packages"`
 	Preset           string   `json:"preset"`
+
+	// PriorSettings records each guest setting avdslim changed, keyed
+	// "<namespace>/<key>", holding the value read from the device *before* the
+	// change. "null" means the setting was unset. `off` replays these so it puts
+	// back what was actually there instead of guessing at stock defaults.
+	PriorSettings map[string]string `json:"prior_settings,omitempty"`
+}
+
+// SlimOptions controls what Slim changes on the guest.
+type SlimOptions struct {
+	Aggressive   bool
+	KeepPackages []string
+
+	// DisableAnimations zeroes window/transition/animator scales. Opt-in: it
+	// changes how the guest behaves, not just how much RAM it uses. With the
+	// animator duration at 0, some View/Compose animations invoke their end
+	// callbacks synchronously, which can hide or manufacture races in UI tests.
+	DisableAnimations bool
+}
+
+// guestSetting is a single `settings put` that avdslim performs.
+type guestSetting struct {
+	Namespace string // global | secure | system
+	Key       string
+	Value     string
+
+	// Restore is false for settings that must not be reverted. Putting
+	// user_setup_complete back to 0 would re-trigger the setup wizard.
+	Restore bool
+}
+
+// memorySettings reduce resource use without altering observable app behaviour.
+var memorySettings = []guestSetting{
+	{Namespace: "global", Key: "background_process_limit", Value: "4", Restore: true},
+	{Namespace: "global", Key: "auto_sync", Value: "0", Restore: true},
+	{Namespace: "secure", Key: "location_mode", Value: "0", Restore: true},
+}
+
+// provisioningSettings skip first-run setup. Deliberately never restored.
+var provisioningSettings = []guestSetting{
+	{Namespace: "secure", Key: "user_setup_complete", Value: "1", Restore: false},
+	{Namespace: "global", Key: "device_provisioned", Value: "1", Restore: false},
+}
+
+// animationSettings are applied only when SlimOptions.DisableAnimations is set.
+var animationSettings = []guestSetting{
+	{Namespace: "global", Key: "window_animation_scale", Value: "0", Restore: true},
+	{Namespace: "global", Key: "transition_animation_scale", Value: "0", Restore: true},
+	{Namespace: "global", Key: "animator_duration_scale", Value: "0", Restore: true},
+}
+
+func settingKey(s guestSetting) string { return s.Namespace + "/" + s.Key }
+
+// getSetting reads a guest setting, returning "null" when it is unset.
+func (c *Client) getSetting(serial, namespace, key string) string {
+	out, err := c.Exec("-s", serial, "shell", "settings", "get", namespace, key)
+	if err != nil {
+		return "null"
+	}
+	v := strings.TrimSpace(out)
+	if v == "" {
+		return "null"
+	}
+	return v
+}
+
+// applySettings records the pre-change value of each restorable setting, then
+// writes the new value. Returns the recorded values for persistence.
+func (c *Client) applySettings(serial string, settings []guestSetting, prior map[string]string) {
+	for _, s := range settings {
+		if s.Restore {
+			if _, seen := prior[settingKey(s)]; !seen {
+				prior[settingKey(s)] = c.getSetting(serial, s.Namespace, s.Key)
+			}
+		}
+		c.Exec("-s", serial, "shell", "settings", "put", s.Namespace, s.Key, s.Value)
+	}
+}
+
+// writeStateFile writes the state JSON via stdin rather than building an
+// `echo '...' > file` shell string, so no value in the JSON can affect quoting.
+func (c *Client) writeStateFile(serial string, state SlimState) error {
+	payload, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(c.adbPath, "-s", serial, "shell", "cat > "+StateFilePath)
+	cmd.Stdin = bytes.NewReader(payload)
+	return cmd.Run()
 }
 
 type Client struct {
@@ -101,17 +191,17 @@ func (c *Client) ResolveDevice(args []string) (string, error) {
 	return "", fmt.Errorf("device serial required")
 }
 
-func (c *Client) Slim(serial string, aggressive bool, keepPackages []string) (int, error) {
+func (c *Client) Slim(serial string, opts SlimOptions) (int, error) {
 	targetPackages := make([]string, 0, 50)
 	for _, pkgs := range bloat.StandardBloatCategories {
 		targetPackages = append(targetPackages, pkgs...)
 	}
-	if aggressive {
+	if opts.Aggressive {
 		targetPackages = append(targetPackages, bloat.AggressiveBloatPackages...)
 	}
 
 	keepMap := make(map[string]bool)
-	for _, k := range keepPackages {
+	for _, k := range opts.KeepPackages {
 		keepMap[k] = true
 	}
 
@@ -136,28 +226,31 @@ func (c *Client) Slim(serial string, aggressive bool, keepPackages []string) (in
 		}
 	}
 
-	// Persist state JSON
+	// Apply settings, recording each prior value first so `off` can put back
+	// exactly what was there.
+	prior := make(map[string]string)
+	c.applySettings(serial, memorySettings, prior)
+	c.applySettings(serial, provisioningSettings, prior)
+	if opts.DisableAnimations {
+		c.applySettings(serial, animationSettings, prior)
+		fmt.Println("   ✓ Animations disabled (window/transition/animator scale = 0)")
+	}
+
+	// Persist state JSON. Written after the settings pass so PriorSettings is
+	// populated; a state file without it would leave `off` unable to restore.
 	preset := "Standard"
-	if aggressive {
+	if opts.Aggressive {
 		preset = "Aggressive"
 	}
 	state := SlimState{
 		Timestamp:        time.Now().Format(time.RFC3339),
 		DisabledPackages: disabledList,
 		Preset:           preset,
+		PriorSettings:    prior,
 	}
-	stateJson, _ := json.Marshal(state)
-	c.Exec("-s", serial, "shell", "echo", fmt.Sprintf("'%s'", string(stateJson)), ">", StateFilePath)
-
-	// Tune Settings
-	c.Exec("-s", serial, "shell", "settings", "put", "global", "window_animation_scale", "0")
-	c.Exec("-s", serial, "shell", "settings", "put", "global", "transition_animation_scale", "0")
-	c.Exec("-s", serial, "shell", "settings", "put", "global", "animator_duration_scale", "0")
-	c.Exec("-s", serial, "shell", "settings", "put", "global", "background_process_limit", "4")
-	c.Exec("-s", serial, "shell", "settings", "put", "global", "auto_sync", "0")
-	c.Exec("-s", serial, "shell", "settings", "put", "secure", "location_mode", "0")
-	c.Exec("-s", serial, "shell", "settings", "put", "secure", "user_setup_complete", "1")
-	c.Exec("-s", serial, "shell", "settings", "put", "global", "device_provisioned", "1")
+	if err := c.writeStateFile(serial, state); err != nil {
+		fmt.Printf("   ⚠️  Could not persist slim state (%v); `avdslim off` will not be able to restore settings.\n", err)
+	}
 
 	// Trim memory
 	c.Exec("-s", serial, "shell", "am", "kill-all")
@@ -169,24 +262,30 @@ func (c *Client) Slim(serial string, aggressive bool, keepPackages []string) (in
 }
 
 func (c *Client) Restore(serial string) (int, error) {
-	var packagesToEnable []string
+	var state SlimState
+	haveState := false
+
 	stateRaw, err := c.Exec("-s", serial, "shell", "cat", StateFilePath)
 	if err == nil && strings.Contains(stateRaw, "disabled_packages") {
-		var state SlimState
-		if json.Unmarshal([]byte(stateRaw), &state) == nil {
-			packagesToEnable = state.DisabledPackages
+		if json.Unmarshal([]byte(strings.TrimSpace(stateRaw)), &state) == nil {
+			haveState = true
 		}
 	}
 
-	if len(packagesToEnable) == 0 {
-		for _, pkgs := range bloat.StandardBloatCategories {
-			packagesToEnable = append(packagesToEnable, pkgs...)
-		}
-		packagesToEnable = append(packagesToEnable, bloat.AggressiveBloatPackages...)
+	// Without a state file there is no record of what avdslim changed, so there
+	// is nothing to undo. Previously this fell back to enabling every package in
+	// the bloat list — including ones the user had disabled deliberately, and
+	// ones avdslim never touched — and then wrote hardcoded "stock" values over
+	// their settings. Report the situation instead of guessing.
+	if !haveState {
+		fmt.Println("   ⚠️  No avdslim state file found on this device.")
+		fmt.Println("      Nothing is known to have been changed by avdslim, so nothing was reverted.")
+		fmt.Printf("      (State lives at %s and is written by `avdslim on`.)\n", StateFilePath)
+		return 0, nil
 	}
 
 	restoredCount := 0
-	for _, pkg := range packagesToEnable {
+	for _, pkg := range state.DisabledPackages {
 		res, _ := c.Exec("-s", serial, "shell", "pm", "enable", pkg)
 		if strings.Contains(res, "enabled") || strings.Contains(res, "new state") {
 			restoredCount++
@@ -194,12 +293,24 @@ func (c *Client) Restore(serial string) (int, error) {
 		}
 	}
 
-	c.Exec("-s", serial, "shell", "settings", "put", "global", "window_animation_scale", "1")
-	c.Exec("-s", serial, "shell", "settings", "put", "global", "transition_animation_scale", "1")
-	c.Exec("-s", serial, "shell", "settings", "put", "global", "animator_duration_scale", "1")
-	c.Exec("-s", serial, "shell", "settings", "delete", "global", "background_process_limit")
-	c.Exec("-s", serial, "shell", "settings", "put", "global", "auto_sync", "1")
-	c.Exec("-s", serial, "shell", "settings", "put", "secure", "location_mode", "3")
+	// Replay recorded values rather than assuming stock defaults. The old code
+	// forced animation scales to 1 and location_mode to 3 unconditionally, which
+	// clobbered any non-default values the user had set (a 0.5 animation scale,
+	// or location deliberately off).
+	for key, prior := range state.PriorSettings {
+		namespace, settingName, ok := strings.Cut(key, "/")
+		if !ok {
+			continue
+		}
+		if prior == "null" {
+			c.Exec("-s", serial, "shell", "settings", "delete", namespace, settingName)
+			fmt.Printf("   ✓ Unset %s (was not set before)\n", key)
+			continue
+		}
+		c.Exec("-s", serial, "shell", "settings", "put", namespace, settingName, prior)
+		fmt.Printf("   ✓ Restored %s = %s\n", key, prior)
+	}
+
 	c.Exec("-s", serial, "shell", "rm", "-f", StateFilePath)
 
 	return restoredCount, nil

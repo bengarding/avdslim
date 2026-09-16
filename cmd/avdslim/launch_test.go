@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/kdbhalala/avdslim/internal/adb"
 )
@@ -23,7 +24,7 @@ func fakeAdb(t *testing.T, output string) *adb.Client {
 func TestWaitForEmulatorGone_ReturnsTrueWhenDeviceAbsent(t *testing.T) {
 	client := fakeAdb(t, "List of devices attached\n")
 
-	if !waitForEmulatorGone(client, "emulator-5554", 2) {
+	if !waitForEmulatorGone(client, "emulator-5554", 2*time.Second) {
 		t.Error("waitForEmulatorGone = false when the device is not listed")
 	}
 }
@@ -34,7 +35,7 @@ func TestWaitForEmulatorGone_ReturnsTrueWhenDeviceAbsent(t *testing.T) {
 func TestWaitForEmulatorGone_ReturnsFalseWhileDeviceStillListed(t *testing.T) {
 	client := fakeAdb(t, "List of devices attached\nemulator-5554\tdevice")
 
-	if waitForEmulatorGone(client, "emulator-5554", 2) {
+	if waitForEmulatorGone(client, "emulator-5554", 2*time.Second) {
 		t.Error("waitForEmulatorGone = true while the device is still listed")
 	}
 }

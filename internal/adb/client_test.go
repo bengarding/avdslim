@@ -1,6 +1,11 @@
 package adb
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 // Animations must never be touched unless explicitly requested. Zeroing
 // animator_duration_scale changes guest behaviour, not just memory use.
@@ -122,5 +127,44 @@ func TestGetSetting_ReportsFailureDistinctlyFromUnset(t *testing.T) {
 	}
 	if v != unsetSettingValue {
 		t.Errorf("getSetting = %q for empty output, want %q", v, unsetSettingValue)
+	}
+}
+
+// Polling loops must use ListEmulatorSerials, which makes exactly one adb call.
+// GetRunningEmulators costs five per device and issues `adb shell` commands that
+// stall against a booting or dying emulator.
+func TestListEmulatorSerials_ParsesStatesAndMakesOneCall(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "adb")
+	counter := filepath.Join(dir, "calls")
+	script := "#!/bin/sh\necho x >> " + counter + "\n" +
+		"printf 'List of devices attached\\nemulator-5554\\tdevice\\nemulator-5556\\toffline\\n1234abcd\\tdevice\\n'\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewClientWithPath(stub)
+	got, err := c.ListEmulatorSerials()
+	if err != nil {
+		t.Fatalf("ListEmulatorSerials: %v", err)
+	}
+
+	// Physical devices (no emulator- prefix) are excluded; offline is reported.
+	if len(got) != 2 {
+		t.Fatalf("got %d entries (%v), want 2 emulator entries", len(got), got)
+	}
+	if got[0].Serial != "emulator-5554" || got[0].State != "device" {
+		t.Errorf("entry 0 = %+v, want emulator-5554/device", got[0])
+	}
+	if got[1].Serial != "emulator-5556" || got[1].State != "offline" {
+		t.Errorf("entry 1 = %+v, want emulator-5556/offline", got[1])
+	}
+
+	data, err := os.ReadFile(counter)
+	if err != nil {
+		t.Fatalf("reading call counter: %v", err)
+	}
+	if n := len(strings.Fields(string(data))); n != 1 {
+		t.Errorf("made %d adb invocations, want exactly 1", n)
 	}
 }

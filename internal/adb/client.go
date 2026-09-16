@@ -214,6 +214,44 @@ func timeoutFor(args []string) time.Duration {
 	return DefaultExecTimeout
 }
 
+// AttachedEmulator is a serial plus its adb connection state, as reported by
+// `adb devices` alone.
+type AttachedEmulator struct {
+	Serial string
+	State  string // device | offline | unauthorized | ...
+}
+
+// ListEmulatorSerials runs only `adb devices` and returns every emulator entry
+// with its state.
+//
+// GetRunningEmulators costs five adb invocations per device (devices, three
+// getprops and a cat of the state file), which makes it far too expensive for a
+// polling loop — and worse, the getprop/cat calls run `adb shell` against a
+// device that may be mid-boot or mid-shutdown, exactly when shell calls stall.
+// Polling loops use this instead: one invocation, no shell, predictable timing.
+func (c *Client) ListEmulatorSerials() ([]AttachedEmulator, error) {
+	out, err := c.Exec("devices")
+	if err != nil {
+		return nil, err
+	}
+
+	var list []AttachedEmulator
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	isFirst := true
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if isFirst {
+			isFirst = false
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) >= 2 && strings.HasPrefix(parts[0], "emulator-") {
+			list = append(list, AttachedEmulator{Serial: parts[0], State: parts[1]})
+		}
+	}
+	return list, nil
+}
+
 func (c *Client) GetRunningEmulators() ([]RunningEmulator, error) {
 	out, err := c.Exec("devices")
 	if err != nil {

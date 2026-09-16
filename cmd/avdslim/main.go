@@ -318,16 +318,16 @@ func handleOn(client *adb.Client, args []string) {
 	fmt.Println("══════════════════════════════════════════════════════════════")
 	fmt.Printf("🎉 Slimming complete for %s!\n", serial)
 	if beforeFootprint > 0 && afterFootprint > 0 {
-		diffFp := beforeFootprint - afterFootprint
-		if diffFp < 0 {
-			diffFp = 0
-		}
-		diffRss := beforeRss - afterRss
-		if diffRss < 0 {
-			diffRss = 0
-		}
-		fmt.Printf("🖥️  Activity Monitor Memory: %dMB -> %dMB (Reclaimed: %dMB)\n", beforeFootprint, afterFootprint, diffFp)
-		fmt.Printf("🖥️  Host Resident RAM (RSS): %dMB -> %dMB (Reclaimed: %dMB)\n", beforeRss, afterRss, diffRss)
+		// Report the signed change. Clamping negatives to zero and labelling the
+		// result "Reclaimed: 0MB" presented a memory *increase* as a neutral
+		// outcome — on a real run RSS went 359MB -> 1752MB and this still said 0.
+		fmt.Printf("🖥️  Activity Monitor Memory: %dMB -> %dMB (%s)\n",
+			beforeFootprint, afterFootprint, describeDelta(beforeFootprint, afterFootprint))
+		fmt.Printf("🖥️  Host Resident RAM (RSS): %dMB -> %dMB (%s)\n",
+			beforeRss, afterRss, describeDelta(beforeRss, afterRss))
+		fmt.Println("   ⚠️  Measured seconds after slimming, while the guest is still")
+		fmt.Println("      restarting services, so it usually reads high. Re-run")
+		fmt.Println("      `avdslim measure` once the emulator settles.")
 	}
 	fmt.Printf("ℹ️  To restore default stock services anytime:\n   avdslim off %s\n\n", serial)
 }
@@ -341,9 +341,24 @@ func handleOff(client *adb.Client, args []string) {
 
 	fmt.Printf("🔄 Restoring default services for %s...\n\n", serial)
 	fmt.Println("1. Re-enabling packages:")
-	count, _ := client.Restore(serial)
+	count, hadState, _ := client.Restore(serial)
+
+	// Without a state file nothing was reverted, so say that plainly instead of
+	// printing "Restored 0 packages" followed by a success banner.
+	if !hadState {
+		fmt.Printf("\nℹ️  Nothing to restore for %s — avdslim has no record of changing it.\n", serial)
+		fmt.Println("   If you slimmed it with an older build, re-run `avdslim on` then `off`.")
+		fmt.Println()
+		return
+	}
+
 	fmt.Printf("   -> Restored %d packages.\n\n", count)
-	fmt.Println("2. Restored default system settings (animations 1.0x, auto-sync on).")
+	// Do not restate what was restored here. Restore() prints the actual per-key
+	// result, and this line used to claim "animations 1.0x, auto-sync on"
+	// unconditionally — contradicting the lines immediately above it, which
+	// correctly reported that animations were never touched and that auto-sync had
+	// been unset rather than enabled.
+	fmt.Println("2. Guest settings returned to their recorded prior values (see above).")
 	fmt.Printf("✅ Successfully restored %s to stock configuration.\n\n", serial)
 }
 
@@ -935,6 +950,19 @@ func handleBench(client *adb.Client, args []string) {
 		fmt.Println(" ℹ️  No disabled packages found — this emulator looks un-slimmed.")
 	}
 	fmt.Println()
+}
+
+// describeDelta renders a before/after memory pair as a signed change, so an
+// increase reads as an increase rather than as zero reclaimed.
+func describeDelta(before, after int) string {
+	switch {
+	case after < before:
+		return fmt.Sprintf("reclaimed %dMB", before-after)
+	case after > before:
+		return fmt.Sprintf("INCREASED by %dMB", after-before)
+	default:
+		return "no change"
+	}
 }
 
 // readSettingForDisplay reads a guest setting for display, returning "" on

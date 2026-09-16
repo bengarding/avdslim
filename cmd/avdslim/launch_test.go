@@ -74,3 +74,22 @@ func TestPositionalArgs_DropsFlags(t *testing.T) {
 		t.Errorf("positionalArgs = %v, want [emulator-5554]", got)
 	}
 }
+
+// A memory increase must not be reported as "Reclaimed: 0MB". On a real run RSS
+// went 359MB -> 1752MB and the clamped arithmetic still printed 0.
+func TestDescribeDelta_ReportsIncreasesHonestly(t *testing.T) {
+	cases := []struct {
+		before, after int
+		want          string
+	}{
+		{8516, 8538, "INCREASED by 22MB"},
+		{359, 1752, "INCREASED by 1393MB"},
+		{2500, 1500, "reclaimed 1000MB"},
+		{1000, 1000, "no change"},
+	}
+	for _, tc := range cases {
+		if got := describeDelta(tc.before, tc.after); got != tc.want {
+			t.Errorf("describeDelta(%d, %d) = %q, want %q", tc.before, tc.after, got, tc.want)
+		}
+	}
+}

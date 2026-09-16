@@ -429,7 +429,10 @@ func (c *Client) Slim(serial string, opts SlimOptions) (int, error) {
 	return len(disabledList), nil
 }
 
-func (c *Client) Restore(serial string) (int, error) {
+// Restore reverts what avdslim recorded changing. hadState reports whether a
+// state file was found; without one there is nothing to revert, and the caller
+// must not claim success.
+func (c *Client) Restore(serial string) (restored int, hadState bool, err error) {
 	var state SlimState
 	haveState := false
 
@@ -449,7 +452,7 @@ func (c *Client) Restore(serial string) (int, error) {
 		fmt.Println("   ⚠️  No avdslim state file found on this device.")
 		fmt.Println("      Nothing is known to have been changed by avdslim, so nothing was reverted.")
 		fmt.Printf("      (State lives at %s and is written by `avdslim on`.)\n", StateFilePath)
-		return 0, nil
+		return 0, false, nil
 	}
 
 	restoredCount := 0
@@ -481,7 +484,7 @@ func (c *Client) Restore(serial string) (int, error) {
 
 	c.Exec("-s", serial, "shell", "rm", "-f", StateFilePath)
 
-	return restoredCount, nil
+	return restoredCount, true, nil
 }
 
 func findAdb() string {

@@ -9,35 +9,36 @@ import (
 	"strings"
 )
 
+// GetInstalledAvds returns one entry per AVD, keyed by config.ini keys, plus
+// "name" (the name the emulator recognises) and "avdPath" (its data directory).
+//
+// Names come from the .ini filenames, not from directory names. Deriving the name
+// from "<dir>.avd" reported e.g. "Pixel_10_Pro_API_37.0" for an AVD the emulator
+// calls "Pixel_10_Pro_API_37", so `avdslim list` printed a name that every other
+// command — and the emulator itself — then failed to resolve.
 func GetInstalledAvds() []map[string]string {
-	avdBase := GetAvdBaseDir()
-
 	var list []map[string]string
-	entries, err := os.ReadDir(avdBase)
-	if err != nil {
-		return list
-	}
 
-	for _, e := range entries {
-		if e.IsDir() && strings.HasSuffix(e.Name(), ".avd") {
-			cfgPath := filepath.Join(avdBase, e.Name(), "config.ini")
-			data, err := os.ReadFile(cfgPath)
-			if err != nil {
-				continue
-			}
-			m := map[string]string{
-				"name": strings.TrimSuffix(e.Name(), ".avd"),
-			}
-			for _, line := range strings.Split(string(data), "\n") {
-				idx := strings.Index(line, "=")
-				if idx > 0 {
-					k := strings.TrimSpace(line[:idx])
-					v := strings.TrimSpace(line[idx+1:])
-					m[k] = v
-				}
-			}
-			list = append(list, m)
+	for _, name := range ListAvdNames() {
+		dir, err := AvdDir(name)
+		if err != nil {
+			continue
 		}
+		data, err := os.ReadFile(filepath.Join(dir, "config.ini"))
+		if err != nil {
+			continue
+		}
+		m := map[string]string{
+			"name":    name,
+			"avdPath": dir,
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			idx := strings.Index(line, "=")
+			if idx > 0 {
+				m[strings.TrimSpace(line[:idx])] = strings.TrimSpace(line[idx+1:])
+			}
+		}
+		list = append(list, m)
 	}
 	return list
 }
@@ -45,41 +46,38 @@ func GetInstalledAvds() []map[string]string {
 func TuneAvd(targetAvd string, ramMb, heapMb int, gpuMode string) error {
 	avdBase := GetAvdBaseDir()
 
-	var configFiles []string
-	filepath.Walk(avdBase, func(path string, info os.FileInfo, err error) error {
-		if err == nil && info != nil && info.Name() == "config.ini" {
-			configFiles = append(configFiles, path)
-		}
-		return nil
-	})
-
-	if len(configFiles) == 0 {
+	// Resolve through the AVD registry rather than walking for config.ini files.
+	// The walk derived each AVD's name from its directory, which is not the AVD's
+	// name, so `tune-avd Pixel_10_Pro_API_37` reported "not found" for an AVD
+	// stored in Pixel_10_Pro_API_37.0.avd. The walk also recursed, so any nested
+	// config.ini showed up as a phantom AVD.
+	installed := GetInstalledAvds()
+	if len(installed) == 0 {
 		return fmt.Errorf("no AVD configurations found in %s", avdBase)
 	}
 
-	var fileToTune string
+	var avdName, fileToTune string
 	if targetAvd != "" {
-		for _, f := range configFiles {
-			avdName := strings.TrimSuffix(filepath.Base(filepath.Dir(f)), ".avd")
-			if strings.EqualFold(avdName, targetAvd) {
-				fileToTune = f
+		for _, avd := range installed {
+			if strings.EqualFold(avd["name"], targetAvd) {
+				avdName = avd["name"]
+				fileToTune = filepath.Join(avd["avdPath"], "config.ini")
 				break
 			}
 		}
 		if fileToTune == "" {
-			return fmt.Errorf("AVD %q not found in ~/.android/avd", targetAvd)
+			return fmt.Errorf("AVD %q not found in %s", targetAvd, avdBase)
 		}
-	} else if len(configFiles) == 1 {
-		fileToTune = configFiles[0]
+	} else if len(installed) == 1 {
+		avdName = installed[0]["name"]
+		fileToTune = filepath.Join(installed[0]["avdPath"], "config.ini")
 	} else {
 		fmt.Println("Found multiple AVDs. Please specify one:")
-		for _, f := range configFiles {
-			fmt.Printf("  • %s\n", strings.TrimSuffix(filepath.Base(filepath.Dir(f)), ".avd"))
+		for _, avd := range installed {
+			fmt.Printf("  • %s\n", avd["name"])
 		}
 		return fmt.Errorf("please specify AVD name")
 	}
-
-	avdName := strings.TrimSuffix(filepath.Base(filepath.Dir(fileToTune)), ".avd")
 	fmt.Printf("⚙️  Tuning config.ini for %q (RAM: %dMB, Heap: %dMB)...\n", avdName, ramMb, heapMb)
 
 	data, err := os.ReadFile(fileToTune)

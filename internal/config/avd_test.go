@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -185,5 +186,94 @@ func TestIsPlayStoreImage(t *testing.T) {
 				t.Errorf("IsPlayStoreImage(%v) = true, want false", cfg)
 			}
 		})
+	}
+}
+
+// An AVD's name is not its directory name. Real case from a live SDK:
+// "Pixel_10_Pro_API_37" created against android-37.0 is stored in
+// "Pixel_10_Pro_API_37.0.avd". Assuming <name>.avd meant golden snapshots were
+// never found, unbake reported nothing to remove, and restart silently failed to
+// purge hardware-qemu.ini.
+func TestAvdDir_FollowsIniPathWhenDirNameDiffers(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("ANDROID_AVD_HOME", base)
+
+	realDir := filepath.Join(base, "Pixel_10_Pro_API_37.0.avd")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ini := "avd.ini.encoding=UTF-8\npath=" + realDir + "\npath.rel=avd/Pixel_10_Pro_API_37.0.avd\ntarget=android-37.0\n"
+	if err := os.WriteFile(filepath.Join(base, "Pixel_10_Pro_API_37.ini"), []byte(ini), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := AvdDir("Pixel_10_Pro_API_37")
+	if err != nil {
+		t.Fatalf("AvdDir: %v", err)
+	}
+	if got != realDir {
+		t.Errorf("AvdDir = %q, want %q (from the .ini path= key)", got, realDir)
+	}
+}
+
+func TestAvdDir_FallsBackToConventionalLayout(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("ANDROID_AVD_HOME", base)
+
+	// No .ini present: the <name>.avd assumption is the only thing available.
+	got, err := AvdDir("Pixel_9_Pro_API_36")
+	if err != nil {
+		t.Fatalf("AvdDir: %v", err)
+	}
+	if want := filepath.Join(base, "Pixel_9_Pro_API_36.avd"); got != want {
+		t.Errorf("AvdDir = %q, want %q", got, want)
+	}
+}
+
+func TestAvdDir_StillValidatesNameBeforeReadingIni(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("ANDROID_AVD_HOME", base)
+
+	for _, name := range []string{"../escape", "a/b", "..", ""} {
+		if _, err := AvdDir(name); err == nil {
+			t.Errorf("AvdDir(%q) = nil error, want rejection", name)
+		}
+	}
+}
+
+func TestListAvdNames_UsesIniNamesNotDirNames(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("ANDROID_AVD_HOME", base)
+
+	for _, d := range []string{"Pixel_10_Pro_API_37.0.avd", "Pixel_9_Pro_API_36.avd"} {
+		if err := os.MkdirAll(filepath.Join(base, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, dir := range map[string]string{
+		"Pixel_10_Pro_API_37": "Pixel_10_Pro_API_37.0.avd",
+		"Pixel_9_Pro_API_36":  "Pixel_9_Pro_API_36.avd",
+	} {
+		ini := "path=" + filepath.Join(base, dir) + "\n"
+		if err := os.WriteFile(filepath.Join(base, name+".ini"), []byte(ini), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := ListAvdNames()
+	want := []string{"Pixel_10_Pro_API_37", "Pixel_9_Pro_API_36"}
+	if len(got) != len(want) {
+		t.Fatalf("ListAvdNames = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("ListAvdNames[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	// The directory-derived name must not leak through.
+	for _, n := range got {
+		if strings.HasSuffix(n, ".0") {
+			t.Errorf("ListAvdNames returned a directory-derived name: %q", n)
+		}
 	}
 }

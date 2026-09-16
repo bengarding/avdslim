@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -58,24 +60,82 @@ func ValidateSnapshotName(name string) error {
 	return nil
 }
 
-// AvdDir returns the .avd directory for name, honouring $ANDROID_AVD_HOME.
+// AvdDir returns the data directory for the named AVD, honouring
+// $ANDROID_AVD_HOME.
 //
-// Callers must use this rather than joining onto a hardcoded ~/.android/avd,
-// both so that ANDROID_AVD_HOME is respected and so that the name is validated
-// before it can reach a filesystem operation.
+// An AVD's name is NOT its directory name. The authoritative mapping lives in
+// <base>/<name>.ini, whose `path=` key points at the data directory; the two
+// routinely differ. A "Pixel_10_Pro_API_37" AVD created against android-37.0 is
+// stored in "Pixel_10_Pro_API_37.0.avd", for instance. Assuming <name>.avd meant
+// every path-based command silently operated on a directory that did not exist:
+// golden snapshots were never found, unbake reported nothing to remove, and
+// restart quietly failed to purge hardware-qemu.ini.
+//
+// The name is still validated first, since that is what stops a name from argv
+// reaching a filesystem operation it should not.
 func AvdDir(name string) (string, error) {
 	if err := ValidateAvdName(name); err != nil {
 		return "", err
 	}
 	base := GetAvdBaseDir()
-	dir := filepath.Join(base, name+".avd")
 
-	// Defence in depth: even if validation above is ever loosened, the result
-	// must still sit directly beneath the AVD base directory.
+	// Preferred: follow the .ini. Users can legitimately relocate an AVD to
+	// another volume, so a path from here is trusted rather than forced under
+	// base — it comes from the local SDK's own metadata, not from user input.
+	if dir := avdDirFromIni(filepath.Join(base, name+".ini")); dir != "" {
+		return dir, nil
+	}
+
+	// Fallback for an AVD with no .ini: assume the conventional layout, and keep
+	// the containment check for that case.
+	dir := filepath.Join(base, name+".avd")
 	if filepath.Dir(dir) != filepath.Clean(base) {
 		return "", fmt.Errorf("refusing to operate on %q: resolves outside %s", name, base)
 	}
 	return dir, nil
+}
+
+// avdDirFromIni reads the `path=` key out of an AVD's .ini file, returning "" if
+// the file is absent or carries no usable absolute path.
+func avdDirFromIni(iniPath string) string {
+	data, err := os.ReadFile(iniPath)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, val, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(key) != "path" {
+			continue
+		}
+		val = strings.TrimSpace(val)
+		if val == "" || !filepath.IsAbs(val) {
+			continue
+		}
+		return filepath.Clean(val)
+	}
+	return ""
+}
+
+// ListAvdNames returns the AVD names the emulator itself recognises, taken from
+// the .ini filenames rather than from directory names.
+func ListAvdNames() []string {
+	base := GetAvdBaseDir()
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".ini") {
+			continue
+		}
+		name := strings.TrimSuffix(e.Name(), ".ini")
+		if ValidateAvdName(name) == nil {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // SnapshotsDir returns the directory holding all snapshots for an AVD.

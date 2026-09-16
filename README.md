@@ -8,31 +8,57 @@
 [![Release](https://img.shields.io/github/v/release/kdbhalala/avdslim)](https://github.com/kdbhalala/avdslim/releases)
 [![GitHub Marketplace](https://img.shields.io/badge/Marketplace-AVD--SLIM-blue?logo=github-actions&logoColor=white)](https://github.com/marketplace/actions/avd-slim-android-emulator-ram-ci-optimizer)
 
-`avdslim` is a lightweight, zero-dependency CLI tool that reduces Android Virtual Device (AVD) host memory consumption from **~8 GB down to ~1.5 GB** and cuts idle CPU overhead to near-zero on Apple Silicon & Linux.
+`avdslim` is a lightweight, zero-dependency CLI tool that cuts Android Virtual Device (AVD) host memory consumption — on one measured Apple Silicon setup, from **~8.5 GB to ~2.5 GB** of Activity Monitor footprint (**~6.5 GB to ~1.5 GB** of dirty RAM) — and reduces idle CPU overhead, on Apple Silicon & Linux.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│  Before:  qemu-system-aarch64  ██████████████████████████  8,518 MB    │
-│  After:   qemu-system-aarch64  █████                       1,560 MB    │
+│  Activity Monitor (phys_footprint), one Pixel 10 Pro AVD on M-series:  │
 │                                                                        │
-│  ⚡ Reclaimed: ~6.0 GB host RAM (82% reduction)                        │
+│  Before:  qemu-system-aarch64  ██████████████████████████  8,518 MB    │
+│  After:   qemu-system-aarch64  ███████                     2,498 MB    │
+│                                                                        │
+│  ⚡ Reclaimed: ~6.0 GB host RAM (71% reduction)                        │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
+<sub>Both figures are `phys_footprint`, so they compare like for like. Dirty RAM
+(`footprint -p`) drops from ~6,500 MB to ~1,560 MB. See
+[Memory Footprint Breakdown](#-memory-footprint-breakdown) — these are one
+machine's measurements, not a benchmark.</sub>
+
 ---
 
-## 🛡️ Fidelity & Safety Guarantee
+## 🛡️ What It Touches, and What It Doesn't
 
-The #1 fear with debloating tools is silent breakage. `avdslim` is designed to be **safe by default**:
+The #1 fear with debloating tools is silent breakage. Here is what `avdslim`
+actually does, stated as scope rather than as a guarantee — this is a
+`pm disable-user` wrapper, and only testing your own app can confirm your app
+still behaves.
 
-| Subsystem / Service | Status | Guarantee |
-| :--- | :---: | :--- |
-| **Firebase Cloud Messaging (FCM)** | ✅ **100% Active** | `GcmService` allowlisted; push notifications work out of the box |
-| **Firebase Auth & Google Sign-In** | ✅ **100% Active** | Core `com.google.android.gms` APIs are protected and never disabled |
-| **Android System WebView** | ✅ **100% Active** | Chromium engine, JavaScript, and in-app browsers untouched |
-| **Flutter / React Native / Native** | ✅ **100% Active** | Hot reload, DevTools, debugging, and JNI/NDK runtimes work 100% |
-| **Localhost & Network Sockets** | ✅ **100% Active** | TCP/UDP, Metro bundler (`:8081`), and adb reverse unaffected |
-| **Zero-Risk Revert (`restore`)** | ✅ **Instant Undo** | One command (`avdslim restore`) instantly re-enables all stock services |
+**Not in any disable list** (see `avdslim profiles` for the full lists):
+
+| Subsystem / Service | Notes |
+| :--- | :--- |
+| `com.google.android.gms` (Play Services core) | Never disabled, so Firebase Auth, FCM and the Maps SDK keep working |
+| Android System WebView | Not in any list; Chromium engine and in-app browsers untouched |
+| Flutter / React Native / native runtimes | Not in any list; hot reload, DevTools, JNI/NDK unaffected |
+| Localhost & network sockets | Nothing touches networking; TCP/UDP, Metro (`:8081`) and `adb reverse` unaffected |
+
+**Caveats worth knowing before you rely on it:**
+
+* `--aggressive` disables `com.android.vending` (Play Store),
+  `com.android.chrome`, and the setup wizard packages. On some images this
+  **can** affect FCM registration and it definitely breaks Play Billing and
+  Play Integrity testing. Don't use `--aggressive` if you test those.
+* The standard list disables `com.google.android.as`
+  (Android System Intelligence) on images that have it, which on some
+  Android versions affects notification ranking and autofill.
+* Animation scales are **left alone by default**. Pass `--disable-animations`
+  to zero them — see the note in [Instant Undo / Restore](#7-instant-undo--restore-restore-off)
+  about why that can matter for UI tests.
+* `avdslim restore` reverts what avdslim recorded changing, using the state
+  file written by `avdslim on`. If that file is gone, there is no record and
+  restore reports that it changed nothing rather than guessing.
 
 ---
 
@@ -42,7 +68,7 @@ When creating Virtual Devices in **Android Studio Device Manager**, your choice 
 
 | System Image Type | Status | Why? |
 | :--- | :---: | :--- |
-| **Google APIs** *(Standard 4 KB)* | ✅ **ALWAYS USE (Best)** | **100% Firebase Auth, FCM Push & Maps active** with zero Play Store background updaters. Allows `adb root` so `avdslim` can compact kernel memory. **Runs ultra-smooth at 1024 MB RAM**. |
+| **Google APIs** *(Standard 4 KB)* | ✅ **ALWAYS USE (Best)** | Firebase Auth, FCM Push & Maps work, with no Play Store background updaters. Allows `adb root` so `avdslim` can compact kernel memory. **Runs ultra-smooth at 1024 MB RAM**. |
 | **Google Play** | ❌ **AVOID** | Runs heavy Play Store self-updaters and background Play Protect scanning loops. Production build locks out `adb root` (cannot flush kernel caches). Consumes ~40% more RAM. |
 | **16 KB Page Size** *(`ps16k`)* | ❌ **AVOID** | Hardcodes a **4,096 MB minimum RAM ceiling in QEMU** (ignoring low-memory flags). Uses 4x larger page buffers. Only use if specifically debugging 16K native C/C++ alignment. |
 
@@ -70,7 +96,7 @@ Just like `simslim` silences iOS simulators via `launchctl`, `avdslim`:
    - **Linux / Ubuntu (Headless CI / Docker)**: Auto-detects headless environments (no `$DISPLAY`) and uses Google SwiftShader (`-gpu swiftshader_indirect`) to avoid display server crashes while bounding memory.
    - **Windows 10 / 11**: Direct3D 11 via ANGLE or native Desktop OpenGL / Vulkan.
 3. **Disables 24+ Bloat Daemons**: Silences non-essential Google background services via `pm disable-user --user 0`.
-4. **Eliminates Animation Lag**: Sets window, transition, and animator scales to 0x.
+4. **Optionally Eliminates Animation Lag**: Sets window, transition, and animator scales to 0x — **only when you pass `--disable-animations`**. Off by default, because zeroing `animator_duration_scale` changes guest behaviour rather than just memory use.
 5. **Limits Background Churn**: Caps `background_process_limit = 4` (protecting OAuth and biometrics) and disables auto-sync.
 6. **Drops Caches**: Flushes Linux page caches and compacts memory heaps.
 
@@ -87,19 +113,47 @@ Just like `simslim` silences iOS simulators via `launchctl`, `avdslim`:
 > **Note on Activity Monitor vs Dirty RAM**:  
 > macOS Activity Monitor reports `phys_footprint` from Apple's Mach kernel ledger. This includes ~530 MB of compressed pages from the initial boot spike and Metal GPU display pipeline buffers. The actual dirty physical memory held in RAM is **~1.5 GB** (verified with `footprint -p <pid>`).
 
+> **These are one machine's measurements, not a benchmark.** They come from a
+> Pixel 10 Pro / Pixel 5 AVD on Apple Silicon. Your numbers depend on the system
+> image, resolution, GPU mode and host. To measure your own, run
+> `avdslim measure` before and after `avdslim on`. Note that `avdslim bench`
+> reports the *current* measured state only — it deliberately does not print a
+> "savings vs stock" figure, because it has no way to know what your stock
+> baseline was.
+
 ---
 
 ## 🚀 Installation
 
-### Option 1: One-Line Installer (Fastest)
-```bash
-curl -fsSL https://raw.githubusercontent.com/kdbhalala/avdslim/main/install.sh | bash
-```
+### Option 1: Homebrew (recommended)
 
-### Option 2: Homebrew (macOS / Linux directly from this repo)
+The formula pins a SHA-256 for each artifact, so Homebrew verifies the download
+for you.
+
 ```bash
 brew tap kdbhalala/avdslim https://github.com/kdbhalala/avdslim.git
 brew install avdslim
+```
+
+### Option 2: Install script
+
+`install.sh` downloads `checksums.txt` from the same release and verifies the
+tarball's SHA-256 before extracting anything, aborting on mismatch.
+
+Prefer fetching the script at a tag and reading it before you run it, rather
+than piping a moving branch straight into a shell:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/kdbhalala/avdslim/v1.0.5/install.sh
+less install.sh          # read it
+bash install.sh
+```
+
+Releases also carry a build provenance attestation, which you can verify
+independently of the checksum:
+
+```bash
+gh attestation verify avdslim_v1.0.5_darwin_arm64.tar.gz --repo kdbhalala/avdslim
 ```
 
 ### Option 3: Go Install
@@ -130,7 +184,24 @@ Prefer clicking the green **"Play"** button in Android Studio? Wrap the SDK emul
 avdslim install-shim
 ```
 * **Zero workflow changes**: Android Studio launches automatically stay slimmed (1024 MB, `-lowram`, Metal GPU).
-* **Safe & reversible anytime**: `avdslim uninstall-shim` restores the original SDK binary instantly.
+* **Reversible**: `avdslim uninstall-shim` restores the original SDK binary.
+
+**How it works, and the caveats:** the shim renames the SDK's `emulator` binary
+to `emulator.real` and puts a shell script in its place. That means:
+
+* **If `sdkmanager` updates the emulator package**, the new binary lands at
+  `emulator` and your `emulator.real` backup becomes stale. `uninstall-shim`
+  detects this and refuses rather than replacing the newer binary with the older
+  backup; delete the stale backup and re-run `install-shim`.
+* **If a golden snapshot exists**, shimmed launches boot it with
+  `-no-snapshot-save`, which means **state from that session is discarded on
+  exit**. The shim prints a notice when it does this. Pass `--no-slim` or run
+  `avdslim unbake <avd>` to boot normally.
+* **Not supported on Windows.** The entry point there is `emulator.exe`, and a
+  script cannot stand in for a `.exe` that callers invoke by exact path.
+  `install-shim` refuses on Windows; use `avdslim start` instead.
+* It modifies a **shared** SDK. On a self-hosted CI runner the change outlives
+  the job and affects every later build on that machine.
 
 ---
 
@@ -185,17 +256,38 @@ Don't want to change your workflow? Run `avdslim watch` in the background. Whene
 ```bash
 avdslim watch
 ```
-*(Options: pass `--aggressive` or `--keep=<package>`)*.
+*(Options: pass `--aggressive`, `--keep=<package>` or `--disable-animations`)*.
+
+> ⚠️ `watch` modifies **every** emulator that boots while it runs, including one
+> you started deliberately stock to reproduce a bug, and including emulators
+> under test in CI. That is the point of the mode, but it means the environment
+> your tests run in is no longer the environment you configured.
 
 ---
 
 ### 7. Instant Undo / Restore (`restore`, `off`)
-Need to verify a bug with 100% stock Google services? One command immediately re-enables all disabled packages, restores animations to 1.0x, and resets background limits:
+Reverts what avdslim recorded changing: re-enables the packages it disabled and
+puts each setting back to the value it read **before** changing it.
 ```bash
 avdslim restore
 # Or use alias:
 avdslim off
 ```
+
+* `avdslim on` writes a state file to `/data/local/tmp/avdslim_state.json`
+  recording the packages it disabled and the prior value of every setting it
+  touched. `restore` replays exactly that. **If the state file is gone**
+  (for example after a cold boot that wiped `/data/local/tmp`), there is no
+  record of what changed, and `restore` reports that it changed nothing rather
+  than enabling packages it may never have disabled.
+* `user_setup_complete` and `device_provisioned` are recorded but deliberately
+  **not** reverted — setting them back to `0` re-triggers the setup wizard.
+* **On animations:** avdslim leaves animation scales alone unless you pass
+  `--disable-animations`. If you do opt in, note that
+  `animator_duration_scale = 0` changes behaviour, not just performance — some
+  View/Compose animations invoke their end callbacks synchronously at duration
+  zero, which can hide or manufacture races in UI tests. `restore` puts back
+  whatever value you had, including a non-default one like `0.5`.
 
 ---
 
@@ -295,7 +387,7 @@ avdslim doctor
 ---
 
 ### 15. View Bloat Profiles (`profiles`)
-Inspects the list of disabled packages categorized by function (Assistant, Telephony, Consumer Bloat, etc.) and guaranteed core services:
+Inspects the list of disabled packages categorized by function (Assistant, Telephony, Consumer Bloat, etc.), what is not in any disable list, and the caveats that apply:
 ```bash
 avdslim profiles
 ```

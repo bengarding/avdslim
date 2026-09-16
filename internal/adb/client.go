@@ -3,6 +3,7 @@ package adb
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -115,9 +116,18 @@ func (c *Client) writeStateFile(serial string, state SlimState) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(c.adbPath, "-s", serial, "shell", "cat > "+StateFilePath)
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultExecTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, c.adbPath, "-s", serial, "shell", "cat > "+StateFilePath)
 	cmd.Stdin = bytes.NewReader(payload)
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("writing state file timed out after %s", DefaultExecTimeout)
+		}
+		return err
+	}
+	return nil
 }
 
 type Client struct {
@@ -130,10 +140,55 @@ func NewClient() *Client {
 	}
 }
 
+const (
+	// DefaultExecTimeout bounds an ordinary adb invocation. Without a bound, a
+	// wedged adb server or an unauthorized device leaves the caller blocked
+	// forever — `avdslim watch` would sit there silently doing nothing.
+	DefaultExecTimeout = 30 * time.Second
+
+	// BlockingExecTimeout covers subcommands that are *meant* to wait on device
+	// state, such as wait-for-device.
+	BlockingExecTimeout = 5 * time.Minute
+)
+
+// blockingSubcommands legitimately block until the device changes state, so
+// they get the longer bound rather than the default.
+var blockingSubcommands = map[string]bool{
+	"wait-for-device":       true,
+	"wait-for-any-device":   true,
+	"wait-for-boot":         true,
+	"wait-for-usb-device":   true,
+	"wait-for-local-device": true,
+}
+
+// Exec runs adb with a timeout appropriate for the subcommand.
 func (c *Client) Exec(args ...string) (string, error) {
-	cmd := exec.Command(c.adbPath, args...)
+	return c.ExecTimeout(timeoutFor(args), args...)
+}
+
+// ExecTimeout runs adb, killing it if it exceeds d.
+func (c *Client) ExecTimeout(d time.Duration, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, c.adbPath, args...)
 	out, err := cmd.CombinedOutput()
+
+	// CommandContext reports the kill as a generic "signal: killed", which tells
+	// the user nothing. Surface the timeout explicitly instead.
+	if ctx.Err() == context.DeadlineExceeded {
+		return string(out), fmt.Errorf("adb %s timed out after %s", strings.Join(args, " "), d)
+	}
 	return string(out), err
+}
+
+func timeoutFor(args []string) time.Duration {
+	for _, a := range args {
+		if blockingSubcommands[a] {
+			return BlockingExecTimeout
+		}
+	}
+	return DefaultExecTimeout
 }
 
 func (c *Client) GetRunningEmulators() ([]RunningEmulator, error) {

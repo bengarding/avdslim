@@ -1,21 +1,34 @@
 package host
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// probeTimeout bounds the host inspection helpers. lsof in particular can hang
+// for a long time when a network mount is unresponsive, and these are only used
+// to report memory figures — never worth blocking the CLI on.
+const probeTimeout = 10 * time.Second
+
+// RunProbe executes a short-lived host command with a timeout.
+func RunProbe(name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
 
 func FindHostPidForSerial(serial string) int {
 	portStr := strings.TrimPrefix(serial, "emulator-")
 
 	// 1. Try lsof on console port (e.g. 5554) - fastest and most precise
 	if portStr != "" {
-		cmd := exec.Command("lsof", "-i", ":"+portStr, "-sTCP:LISTEN", "-t")
-		if out, err := cmd.CombinedOutput(); err == nil {
+		if out, err := RunProbe("lsof", "-i", ":"+portStr, "-sTCP:LISTEN", "-t"); err == nil {
 			fields := strings.Fields(string(out))
 			if len(fields) > 0 {
 				if pid, err := strconv.Atoi(fields[0]); err == nil && pid > 0 {
@@ -26,8 +39,7 @@ func FindHostPidForSerial(serial string) int {
 	}
 
 	// 2. Fallback to process inspection
-	cmd := exec.Command("ps", "-eo", "pid,command")
-	out, err := cmd.CombinedOutput()
+	out, err := RunProbe("ps", "-eo", "pid,command")
 	if err != nil {
 		return 0
 	}
@@ -76,8 +88,7 @@ func GetHostRssMb(pid int) int {
 		}
 	}
 
-	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "rss=")
-	out, err := cmd.CombinedOutput()
+	out, err := RunProbe("ps", "-p", strconv.Itoa(pid), "-o", "rss=")
 	if err == nil {
 		if kb, err := strconv.Atoi(strings.TrimSpace(string(out))); err == nil {
 			return kb / 1024
@@ -87,8 +98,7 @@ func GetHostRssMb(pid int) int {
 }
 
 func GetHostFootprintMb(pid int) int {
-	cmd := exec.Command("footprint", "-p", strconv.Itoa(pid))
-	if out, err := cmd.CombinedOutput(); err == nil {
+	if out, err := RunProbe("footprint", "-p", strconv.Itoa(pid)); err == nil {
 		for _, line := range strings.Split(string(out), "\n") {
 			if strings.Contains(line, "phys_footprint:") {
 				fields := strings.Fields(line)

@@ -25,12 +25,12 @@ func RunDoctor(client *adb.Client) {
 			fmt.Println("   ❌ ADB: Not found in standard SDK path or PATH!")
 			issuesCount++
 		} else {
-			adbVerOut, _ := exec.Command(adbPath, "version").CombinedOutput()
+			adbVerOut, _ := host.RunProbe(adbPath, "version")
 			firstLine := strings.Split(string(adbVerOut), "\n")[0]
 			fmt.Printf("   ✓ ADB: %s (%s)\n", adbPath, strings.TrimSpace(firstLine))
 		}
 	} else {
-		adbVerOut, _ := exec.Command(adbPath, "version").CombinedOutput()
+		adbVerOut, _ := host.RunProbe(adbPath, "version")
 		firstLine := strings.Split(string(adbVerOut), "\n")[0]
 		fmt.Printf("   ✓ ADB: %s (%s)\n", adbPath, strings.TrimSpace(firstLine))
 	}
@@ -41,12 +41,12 @@ func RunDoctor(client *adb.Client) {
 			fmt.Println("   ⚠️  Android Emulator: Not found in standard SDK path or PATH")
 			issuesCount++
 		} else {
-			emuVerOut, _ := exec.Command(emuPath, "-version").CombinedOutput()
+			emuVerOut, _ := host.RunProbe(emuPath, "-version")
 			firstLine := strings.Split(string(emuVerOut), "\n")[0]
 			fmt.Printf("   ✓ Emulator: %s (%s)\n", emuPath, strings.TrimSpace(firstLine))
 		}
 	} else {
-		emuVerOut, _ := exec.Command(emuPath, "-version").CombinedOutput()
+		emuVerOut, _ := host.RunProbe(emuPath, "-version")
 		firstLine := strings.Split(string(emuVerOut), "\n")[0]
 		fmt.Printf("   ✓ Emulator: %s (%s)\n", emuPath, strings.TrimSpace(firstLine))
 	}

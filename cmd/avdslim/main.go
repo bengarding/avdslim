@@ -872,7 +872,12 @@ func handleInstallShim(args []string) {
 
 	fmt.Println("✅ Successfully installed emulator shim!")
 	fmt.Println("   • From now on, launching emulators via Android Studio 'Play' button")
-	fmt.Println("     will automatically inject -memory 1024 -lowram -no-audio flags.")
+	fmt.Printf("     will automatically inject -memory %d -lowram -no-audio flags.\n", ramMb)
+	fmt.Println("   • It replaces the SDK's emulator binary, backing the original up as")
+	fmt.Println("     emulator.real. If sdkmanager later updates the emulator package,")
+	fmt.Println("     re-run install-shim to re-wrap the new binary.")
+	fmt.Println("   • If a golden snapshot exists, launches boot it and DISCARD state on")
+	fmt.Println("     exit. The shim prints a notice when it does this.")
 	fmt.Println("   • To restore stock Android Studio emulator behavior anytime:")
 	fmt.Println("     avdslim uninstall-shim")
 	fmt.Println()

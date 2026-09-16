@@ -29,9 +29,13 @@ manual, nothing syncs them.
 
 `install.sh` (pinned `VERSION`, darwin/linux only — no Windows branch),
 Homebrew tap (`brew tap kdbhalala/avdslim`), `go install
-github.com/kdbhalala/avdslim/cmd/avdslim@latest` (note: go.mod module path is
-`github.com/krunalbhalala/avdslim`), GitHub Action (`action.yml`:
-installs binary, `install-shim`, optional `watch` daemon).
+github.com/kdbhalala/avdslim/cmd/avdslim@latest`, GitHub Action (`action.yml`:
+installs binary via the action's own pinned `install.sh`, `install-shim`,
+optional `watch` daemon).
+
+`install.sh` verifies the tarball SHA-256 against the release `checksums.txt`
+before extracting. Releases carry a provenance attestation; verify with
+`gh attestation verify <tarball> --repo kdbhalala/avdslim`.
 
 ## Known failure modes
 

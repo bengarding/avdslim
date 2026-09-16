@@ -130,3 +130,60 @@ func TestSnapshotDir_RejectsTraversalInSnapshotName(t *testing.T) {
 		}
 	}
 }
+
+func TestIs16KPageSize_ChecksBothTagKeys(t *testing.T) {
+	// doctor read only tag.ids while tune-avd read only tag.id, so the two
+	// commands could disagree about the same AVD. Both keys must be consulted.
+	for name, cfg := range map[string]map[string]string{
+		"tag.id singular": {"tag.id": "google_apis_ps16k"},
+		"tag.ids plural":  {"tag.ids": "google_apis_page_size_16kb"},
+		"tag.id 16kb":     {"tag.id": "android-page_size_16kb"},
+		"sysdir ps16k":    {"image.sysdir.1": "system-images/android-36/google_apis_ps16k/arm64-v8a/"},
+		"sysdir 16kb":     {"image.sysdir.1": "system-images/android-36/foo16kb/arm64-v8a/"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !Is16KPageSize(cfg) {
+				t.Errorf("Is16KPageSize(%v) = false, want true", cfg)
+			}
+		})
+	}
+
+	for name, cfg := range map[string]map[string]string{
+		"plain google apis": {"tag.id": "google_apis", "image.sysdir.1": "system-images/android-35/google_apis/arm64-v8a/"},
+		"empty":             {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if Is16KPageSize(cfg) {
+				t.Errorf("Is16KPageSize(%v) = true, want false", cfg)
+			}
+		})
+	}
+}
+
+func TestIsPlayStoreImage(t *testing.T) {
+	for name, cfg := range map[string]map[string]string{
+		"enabled true": {"PlayStore.enabled": "true"},
+		"enabled yes":  {"PlayStore.enabled": "yes"},
+		"enabled TRUE": {"PlayStore.enabled": "TRUE"},
+		"tag.id":       {"tag.id": "google_apis_playstore"},
+		"tag.ids":      {"tag.ids": "google_apis_playstore"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !IsPlayStoreImage(cfg) {
+				t.Errorf("IsPlayStoreImage(%v) = false, want true", cfg)
+			}
+		})
+	}
+
+	for name, cfg := range map[string]map[string]string{
+		"enabled false": {"PlayStore.enabled": "false"},
+		"google apis":   {"tag.id": "google_apis"},
+		"empty":         {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if IsPlayStoreImage(cfg) {
+				t.Errorf("IsPlayStoreImage(%v) = true, want false", cfg)
+			}
+		})
+	}
+}

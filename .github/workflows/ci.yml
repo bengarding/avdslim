@@ -74,10 +74,11 @@ jobs:
           go_default="$(sed -n 's/^var version = "\(.*\)"$/\1/p' cmd/avdslim/main.go | head -n1)"
           sh="$(sed -n 's/^VERSION="\${AVDSLIM_VERSION:-v\(.*\)}"$/\1/p' install.sh | head -n1)"
           formula="$(sed -n 's/^  version "\(.*\)"$/\1/p' Formula/avdslim.rb | head -n1)"
+          act="$(sed -n "s/^    default: 'v\(.*\)'$/\1/p" action.yml | head -n1)"
 
-          echo "Makefile=$mk go=$go_default install.sh=$sh formula=$formula"
+          echo "Makefile=$mk go=$go_default install.sh=$sh formula=$formula action.yml=$act"
           fail=0
-          for pair in "go:$go_default" "install.sh:$sh" "formula:$formula"; do
+          for pair in "go:$go_default" "install.sh:$sh" "formula:$formula" "action.yml:$act"; do
             name="${pair%%:*}"; val="${pair#*:}"
             if [ -z "$val" ]; then
               echo "::error::could not parse a version from $name"; fail=1; continue

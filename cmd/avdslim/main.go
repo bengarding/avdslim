@@ -115,12 +115,15 @@ Commands:
   snapshot, snap       Capture running emulator (with pre-installed apps & test logins)
                        into Golden Snapshot for instant <1.5s restores
   unbake [avd_name]    Delete Golden Snapshot and return AVD to stock cold boots
-  bench [device]       Show before/after memory & CPU efficiency scoreboard
+  bench [device]       Show measured current memory state (not a before/after
+                       comparison — use 'measure' before and after 'on' for that)
   install-shim         Wrap SDK emulator binary so Android Studio launches stay slim
                        Options: --ram=<MB> (default: 1024)
+                       Note: modifies the SDK in place; not supported on Windows
   uninstall-shim       Restore stock Android SDK emulator binary
   doctor               Audit environment, AVDs, system image 16K overhead & toolchain
-  profiles             List all bloat categories, packages & guaranteed-working services
+  profiles             List bloat categories, packages, what is never disabled
+                       and the caveats that apply
   version              Print avdslim version
 
 Examples:

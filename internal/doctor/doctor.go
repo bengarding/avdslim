@@ -76,14 +76,13 @@ func RunDoctor(client *adb.Client) {
 			name := avd["name"]
 			ram := avd["hw.ramSize"]
 			gpu := avd["hw.gpu.mode"]
-			tag := avd["tag.ids"]
 			target := avd["target"]
 
 			fmt.Printf("   • AVD: %s (Target: %s)\n", name, target)
 
 			// Check System Image Type & Recommendation
-			is16K := strings.Contains(tag, "page_size_16kb") || strings.Contains(avd["image.sysdir.1"], "ps16k") || strings.Contains(avd["image.sysdir.1"], "16kb")
-			isPlayStore := strings.ToLower(avd["PlayStore.enabled"]) == "true" || strings.ToLower(avd["PlayStore.enabled"]) == "yes" || strings.Contains(tag, "playstore") || strings.Contains(avd["tag.id"], "playstore")
+			is16K := config.Is16KPageSize(avd)
+			isPlayStore := config.IsPlayStoreImage(avd)
 
 			if is16K {
 				fmt.Println("     🚨 [AVOID] 16 KB Page Size Image Detected!")
@@ -95,7 +94,7 @@ func RunDoctor(client *adb.Client) {
 				fmt.Println("     ⚠️  [AVOID] 'Google Play' Production Image Detected")
 				fmt.Println("        -> Runs heavy Play Store auto-updater daemons and background security scans.")
 				fmt.Println("        -> Production build locks out `adb root` (cannot drop Linux kernel dirty pagecaches).")
-				fmt.Println("        -> 💡 Recommendation: Use 'Google APIs' image instead (100% Firebase/FCM, 40% less RAM, adb root enabled).")
+				fmt.Println("        -> 💡 Recommendation: Use 'Google APIs' image instead (Firebase/FCM work, less RAM, adb root enabled).")
 				issuesCount++
 			} else {
 				fmt.Println("     ✅ [OPTIMAL] 'Google APIs' (Standard 4 KB pages, Firebase/FCM enabled, adb root capable)")
@@ -181,7 +180,7 @@ func RunDoctor(client *adb.Client) {
 	fmt.Println("│  When creating AVDs in Android Studio Device Manager:                  │")
 	fmt.Println("│                                                                        │")
 	fmt.Println("│  ✅ ALWAYS CHOOSE: \"Google APIs\" (Standard 4 KB pages)                 │")
-	fmt.Println("│     • 100% Firebase Auth, FCM Push, Google Sign-In & Maps support       │")
+	fmt.Println("│     • Firebase Auth, FCM Push, Google Sign-In & Maps all work           │")
 	fmt.Println("│     • Guest root (`adb root`) enabled for instant kernel cache drops   │")
 	fmt.Println("│     • Runs smoothly with 1024 MB RAM (saves 60-70% host memory)        │")
 	fmt.Println("│                                                                        │")

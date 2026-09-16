@@ -53,9 +53,11 @@ func hasShimHeader(path string) (bool, error) {
 	}
 	defer f.Close()
 
+	// io.ReadFull rather than a single Read: Read is permitted to return fewer
+	// bytes than requested without hitting EOF, which could hide the marker.
 	buf := make([]byte, headerProbeBytes)
-	n, err := f.Read(buf)
-	if err != nil && err != io.EOF {
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return false, err
 	}
 	return strings.Contains(string(buf[:n]), shimHeader), nil
@@ -241,7 +243,11 @@ if [ "$NO_SLIM" -ne 1 ]; then
         EXTRA+=("-no-window")
     fi
     if [ "$HAS_SNAP" -eq 0 ] && [ -n "$AVD_NAME" ]; then
-        SNAP_DIR="$HOME/.android/avd/${AVD_NAME}.avd/snapshots/avdslim_clean"
+        # Honour ANDROID_AVD_HOME like the Go code's GetAvdBaseDir does. Hardcoding
+        # $HOME/.android/avd meant the shim could not find a golden snapshot that
+        # 'avdslim bake' had just written elsewhere.
+        AVD_HOME="${ANDROID_AVD_HOME:-$HOME/.android/avd}"
+        SNAP_DIR="$AVD_HOME/${AVD_NAME}.avd/snapshots/avdslim_clean"
         if [ -d "$SNAP_DIR" ]; then
             EXTRA+=("-snapshot" "avdslim_clean" "-no-snapshot-save")
             # Announce this. Booting a golden snapshot with -no-snapshot-save means

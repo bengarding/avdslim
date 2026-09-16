@@ -83,26 +83,43 @@ var animationSettings = []guestSetting{
 
 func settingKey(s guestSetting) string { return s.Namespace + "/" + s.Key }
 
-// getSetting reads a guest setting, returning "null" when it is unset.
-func (c *Client) getSetting(serial, namespace, key string) string {
+// unsetSettingValue is what `settings get` prints for a key that has no value,
+// and what we record to mean "delete this key on restore". It matches Android's
+// own output so a recorded value round-trips unambiguously.
+const unsetSettingValue = "null"
+
+// getSetting reads a guest setting.
+//
+// ok is false when the read itself failed, which is deliberately distinct from
+// the setting being unset (value "null"). Conflating the two is dangerous:
+// Restore deletes any key recorded as "null", so treating a failed read as
+// "unset" would make `off` delete a setting that had a perfectly good value.
+func (c *Client) getSetting(serial, namespace, key string) (string, bool) {
 	out, err := c.Exec("-s", serial, "shell", "settings", "get", namespace, key)
 	if err != nil {
-		return "null"
+		return "", false
 	}
 	v := strings.TrimSpace(out)
 	if v == "" {
-		return "null"
+		return unsetSettingValue, true
 	}
-	return v
+	return v, true
 }
 
 // applySettings records the pre-change value of each restorable setting, then
-// writes the new value. Returns the recorded values for persistence.
+// writes the new value. Recorded values accumulate into prior for persistence.
 func (c *Client) applySettings(serial string, settings []guestSetting, prior map[string]string) {
 	for _, s := range settings {
 		if s.Restore {
 			if _, seen := prior[settingKey(s)]; !seen {
-				prior[settingKey(s)] = c.getSetting(serial, s.Namespace, s.Key)
+				if v, ok := c.getSetting(serial, s.Namespace, s.Key); ok {
+					prior[settingKey(s)] = v
+				} else {
+					// Record nothing rather than guessing. An unrecorded setting
+					// is left untouched by `off`, which is the safe failure mode;
+					// recording "null" would have it deleted.
+					fmt.Printf("   ⚠️  Could not read %s before changing it; `avdslim off` will leave it as-is.\n", settingKey(s))
+				}
 			}
 		}
 		c.Exec("-s", serial, "shell", "settings", "put", s.Namespace, s.Key, s.Value)
@@ -407,7 +424,7 @@ func (c *Client) Restore(serial string) (int, error) {
 		if !ok {
 			continue
 		}
-		if prior == "null" {
+		if prior == unsetSettingValue {
 			c.Exec("-s", serial, "shell", "settings", "delete", namespace, settingName)
 			fmt.Printf("   ✓ Unset %s (was not set before)\n", key)
 			continue

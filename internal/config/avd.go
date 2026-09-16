@@ -101,3 +101,43 @@ func SnapshotDir(avdName, snapshotName string) (string, error) {
 
 // GoldenSnapshotName is the snapshot avdslim bakes and boots from.
 const GoldenSnapshotName = "avdslim_clean"
+
+// Is16KPageSize reports whether an AVD's config describes a 16 KB page-size
+// system image, for which QEMU enforces a 4096 MB RAM floor.
+//
+// Both tag.id and tag.ids are consulted. doctor previously read only tag.ids
+// while tune-avd read only tag.id, so the two commands could disagree about the
+// same AVD — one warning about the 4 GB floor while the other reported a
+// successful tune to 1024 MB.
+// Every known 16 KB marker is checked against every field that can carry one.
+// The original code only looked for "page_size_16kb" in the tag and "ps16k" /
+// "16kb" in image.sysdir.1, so an AVD tagged google_apis_ps16k whose sysdir did
+// not also spell it out went undetected — and was then "tuned" to 1024 MB with
+// no warning that QEMU would silently hold it at the 4096 MB floor.
+func Is16KPageSize(cfg map[string]string) bool {
+	markers := []string{"page_size_16kb", "ps16k", "16kb"}
+	for _, field := range []string{"tag.id", "tag.ids", "image.sysdir.1"} {
+		v := strings.ToLower(cfg[field])
+		for _, m := range markers {
+			if strings.Contains(v, m) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// IsPlayStoreImage reports whether an AVD uses a Google Play production image,
+// which runs Play Store updaters and blocks `adb root`.
+func IsPlayStoreImage(cfg map[string]string) bool {
+	switch strings.ToLower(cfg["PlayStore.enabled"]) {
+	case "true", "yes":
+		return true
+	}
+	for _, key := range []string{"tag.id", "tag.ids"} {
+		if strings.Contains(cfg[key], "playstore") {
+			return true
+		}
+	}
+	return false
+}

@@ -152,8 +152,8 @@ func TuneAvd(targetAvd string, ramMb, heapMb int, gpuMode string) error {
 		fmt.Printf("        avdslim unbake %s\n", avdName)
 	}
 
-	is16K := strings.Contains(kv["tag.id"], "page_size_16kb") || strings.Contains(kv["image.sysdir.1"], "ps16k") || strings.Contains(kv["image.sysdir.1"], "16kb")
-	isPlayStore := strings.ToLower(kv["PlayStore.enabled"]) == "true" || strings.ToLower(kv["PlayStore.enabled"]) == "yes" || strings.Contains(kv["tag.id"], "playstore")
+	is16K := Is16KPageSize(kv)
+	isPlayStore := IsPlayStoreImage(kv)
 	if is16K {
 		fmt.Println("   🚨 Note: This AVD uses a 16 KB page-size image. QEMU enforces a 4096 MB RAM floor.")
 		fmt.Println("      💡 Recommendation: For daily dev at 1024 MB RAM, use standard 4 KB 'Google APIs'.")

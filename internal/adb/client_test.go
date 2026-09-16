@@ -78,3 +78,49 @@ func TestAllSettingKeys_AreUnique(t *testing.T) {
 		seen[k] = s.Key
 	}
 }
+
+// A failed read must not be recorded as "null". Restore deletes any key recorded
+// as unsetSettingValue, so conflating "could not read" with "was not set" would
+// make `avdslim off` delete a setting that had a real value.
+func TestApplySettings_DoesNotRecordUnreadableSettings(t *testing.T) {
+	// /bin/false exits non-zero, so every getSetting call reports a failed read.
+	c := &Client{adbPath: "/usr/bin/false"}
+
+	prior := map[string]string{}
+	c.applySettings("emulator-5554", memorySettings, prior)
+
+	if len(prior) != 0 {
+		t.Errorf("prior = %v, want empty: unreadable settings must not be recorded", prior)
+	}
+	for k, v := range prior {
+		if v == unsetSettingValue {
+			t.Errorf("%q recorded as %q after a failed read; restore would delete it", k, v)
+		}
+	}
+}
+
+// A genuinely unset setting is recorded as unsetSettingValue so restore knows to
+// delete it rather than writing a fabricated default back.
+func TestUnsetSettingValue_MatchesAndroidOutput(t *testing.T) {
+	// `settings get` prints exactly this for a key with no value.
+	if unsetSettingValue != "null" {
+		t.Errorf("unsetSettingValue = %q, want \"null\" to match `settings get` output", unsetSettingValue)
+	}
+}
+
+func TestGetSetting_ReportsFailureDistinctlyFromUnset(t *testing.T) {
+	failing := &Client{adbPath: "/usr/bin/false"}
+	if _, ok := failing.getSetting("emulator-5554", "global", "auto_sync"); ok {
+		t.Error("getSetting reported ok=true when the adb call failed")
+	}
+
+	// Empty output with a zero exit is the "unset" case.
+	empty := &Client{adbPath: "/usr/bin/true"}
+	v, ok := empty.getSetting("emulator-5554", "global", "auto_sync")
+	if !ok {
+		t.Error("getSetting reported ok=false for a successful call")
+	}
+	if v != unsetSettingValue {
+		t.Errorf("getSetting = %q for empty output, want %q", v, unsetSettingValue)
+	}
+}

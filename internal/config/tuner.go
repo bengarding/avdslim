@@ -120,21 +120,7 @@ func TuneAvd(targetAvd string, ramMb, heapMb int, gpuMode string) error {
 	kv["fastboot.forceColdBoot"] = "yes"
 	kv["fastboot.forceFastBoot"] = "no"
 
-	// Write keys in sorted order. Ranging over a Go map is randomised, so the
-	// previous version rewrote config.ini in a different order every run, making
-	// diffs and backups useless for spotting what actually changed.
-	keys := make([]string, 0, len(kv))
-	for k := range kv {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var sb strings.Builder
-	for _, k := range keys {
-		sb.WriteString(fmt.Sprintf("%s=%s\n", k, kv[k]))
-	}
-
-	if err := os.WriteFile(fileToTune, []byte(sb.String()), 0644); err != nil {
+	if err := os.WriteFile(fileToTune, []byte(renderConfigIni(lines, kv)), 0644); err != nil {
 		return err
 	}
 
@@ -179,6 +165,52 @@ func TuneAvd(targetAvd string, ramMb, heapMb int, gpuMode string) error {
 	fmt.Println()
 	fmt.Printf("ℹ️  Note: If this emulator is currently running, restart it to apply changes:\n   avdslim restart %s\n\n", avdName)
 	return nil
+}
+
+// renderConfigIni rewrites config.ini in place: existing keys keep their
+// original position and get their new value, everything else (comments, blank
+// lines, unrecognised syntax) is preserved verbatim, and genuinely new keys are
+// appended in sorted order.
+//
+// The previous implementation rebuilt the file from a map, which dropped every
+// line that did not contain "=" — comments and blank lines were silently
+// deleted — and, because Go randomises map iteration, emitted the keys in a
+// different order on every run, making the .bak diff useless for seeing what
+// actually changed.
+func renderConfigIni(originalLines []string, kv map[string]string) string {
+	written := make(map[string]bool, len(kv))
+
+	var sb strings.Builder
+	for i, line := range originalLines {
+		// Don't re-emit a trailing empty element produced by splitting on "\n".
+		if i == len(originalLines)-1 && line == "" {
+			continue
+		}
+
+		idx := strings.Index(line, "=")
+		if idx > 0 {
+			key := strings.TrimSpace(line[:idx])
+			if val, ok := kv[key]; ok && !written[key] {
+				sb.WriteString(key + "=" + val + "\n")
+				written[key] = true
+				continue
+			}
+		}
+		sb.WriteString(line + "\n")
+	}
+
+	newKeys := make([]string, 0, len(kv))
+	for k := range kv {
+		if !written[k] {
+			newKeys = append(newKeys, k)
+		}
+	}
+	sort.Strings(newKeys)
+	for _, k := range newKeys {
+		sb.WriteString(k + "=" + kv[k] + "\n")
+	}
+
+	return sb.String()
 }
 
 // listSnapshots returns the names of snapshot subdirectories, or nil if there

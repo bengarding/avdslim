@@ -57,7 +57,11 @@ func FindHostPidForSerial(serial string) int {
 			fields := strings.Fields(l)
 			if len(fields) > 0 {
 				if pid, err := strconv.Atoi(fields[0]); err == nil && pid != myPid {
-					if strings.Contains(l, "-port "+portStr) || strings.Contains(l, portStr) {
+					// Only an explicit port argument counts as a match. The old
+					// code also accepted the port appearing anywhere in the
+					// command line, which matches an unrelated PID, a path
+					// fragment, or another emulator's port range.
+					if hasPortArg(fields, portStr) {
 						return pid
 					}
 					candidates = append(candidates, pid)
@@ -66,10 +70,37 @@ func FindHostPidForSerial(serial string) int {
 		}
 	}
 
-	if len(candidates) > 0 {
+	// With no port match, only trust a single candidate. Returning candidates[0]
+	// out of several meant reporting a different emulator's memory as this one's,
+	// which is worse than admitting we don't know: callers treat 0 as "unknown"
+	// and omit the figures rather than printing something wrong.
+	if len(candidates) == 1 {
 		return candidates[0]
 	}
 	return 0
+}
+
+// hasPortArg reports whether the command line passes portStr as the value of a
+// port flag (-port 5554, -ports 5554,5555) rather than merely containing it.
+func hasPortArg(fields []string, portStr string) bool {
+	if portStr == "" {
+		return false
+	}
+	for i, f := range fields {
+		if f != "-port" && f != "-ports" {
+			continue
+		}
+		if i+1 >= len(fields) {
+			continue
+		}
+		// -ports takes a console,adb pair.
+		for _, part := range strings.Split(fields[i+1], ",") {
+			if strings.TrimSpace(part) == portStr {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func GetHostRssMb(pid int) int {

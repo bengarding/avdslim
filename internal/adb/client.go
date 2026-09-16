@@ -213,8 +213,7 @@ func (c *Client) GetRunningEmulators() ([]RunningEmulator, error) {
 			ver, _ := c.Exec("-s", serial, "shell", "getprop", "ro.build.version.release")
 			sdk, _ := c.Exec("-s", serial, "shell", "getprop", "ro.build.version.sdk")
 
-			stateExists, _ := c.Exec("-s", serial, "shell", "ls", StateFilePath)
-			isSlimmed := strings.Contains(stateExists, "avdslim_state.json")
+			isSlimmed := c.HasSlimState(serial)
 
 			list = append(list, RunningEmulator{
 				Serial:         serial,
@@ -226,6 +225,57 @@ func (c *Client) GetRunningEmulators() ([]RunningEmulator, error) {
 		}
 	}
 	return list, nil
+}
+
+// HasSlimState reports whether avdslim's state file is present on the device.
+//
+// This used to be `ls <path>` plus strings.Contains(out, "avdslim_state.json"),
+// which was always true: when the file is missing, ls prints
+// "ls: /data/local/tmp/avdslim_state.json: No such file or directory" — an error
+// message that contains the filename. Every emulator therefore reported as
+// already slimmed, which made `avdslim watch` skip every device it saw and
+// silently never slim anything, and made `list`/`doctor` always print SLIMMED.
+//
+// Checking for a marker from inside the file's contents cannot be satisfied by
+// an error message about the file.
+func (c *Client) HasSlimState(serial string) bool {
+	out, err := c.Exec("-s", serial, "shell", "cat", StateFilePath)
+	return err == nil && strings.Contains(out, "disabled_packages")
+}
+
+// GetAvdName returns the AVD name for a running emulator.
+//
+// `adb -s <serial> emu avd name` replies with the name followed by an "OK" line,
+// or "KO: <reason>" on failure. Callers previously each re-implemented this
+// parsing and then matched with strings.Contains, which collides between AVDs
+// whose names share a prefix (asking for "Pixel_5" matched a running
+// "Pixel_5_API_34").
+func (c *Client) GetAvdName(serial string) (string, error) {
+	out, err := c.Exec("-s", serial, "emu", "avd", "name")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "OK" {
+			continue
+		}
+		if strings.HasPrefix(line, "KO") {
+			return "", fmt.Errorf("emulator console refused avd name request: %s", line)
+		}
+		return line, nil
+	}
+	return "", fmt.Errorf("could not determine AVD name for %s", serial)
+}
+
+// IsAvd reports whether the emulator at serial is running the named AVD, using
+// an exact (case-insensitive) comparison rather than a substring match.
+func (c *Client) IsAvd(serial, avdName string) bool {
+	got, err := c.GetAvdName(serial)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(got, avdName)
 }
 
 func (c *Client) ResolveDevice(args []string) (string, error) {

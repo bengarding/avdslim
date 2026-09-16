@@ -20,7 +20,11 @@ import (
 	"github.com/kdbhalala/avdslim/internal/shim"
 )
 
-const version = "1.0.5"
+// version must be a var, not a const: the Makefile and release workflow both
+// build with -ldflags "-X main.version=<tag>", and the linker can only overwrite
+// a string variable. As a const the injection was silently ignored, so every
+// released binary reported 1.0.5 no matter which tag it was built from.
+var version = "1.0.5"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -586,8 +590,7 @@ func handleStop(client *adb.Client, args []string) {
 		} else {
 			fmt.Println("📱 Running Emulators:")
 			for i, emu := range running {
-				nameOut, _ := client.Exec("-s", emu.Serial, "emu", "avd", "name")
-				name := strings.TrimSpace(strings.Split(nameOut, "\n")[0])
+				name, _ := client.GetAvdName(emu.Serial)
 				fmt.Printf("   [%d] %s (%s)\n", i+1, emu.Serial, name)
 			}
 			fmt.Print("\nSelect an emulator to stop (number): ")
@@ -602,8 +605,7 @@ func handleStop(client *adb.Client, args []string) {
 		}
 	}
 
-	avdNameOut, _ := client.Exec("-s", serial, "emu", "avd", "name")
-	avdName := strings.TrimSpace(strings.Split(avdNameOut, "\n")[0])
+	avdName, _ := client.GetAvdName(serial)
 	if avdName == "" {
 		avdName = serial
 	}
@@ -644,13 +646,8 @@ func handleRestart(client *adb.Client, args []string) {
 		return
 	}
 
-	avdNameOut, _ := client.Exec("-s", serial, "emu", "avd", "name")
-	lines := strings.Split(strings.TrimSpace(avdNameOut), "\n")
-	avdName := ""
-	if len(lines) > 0 {
-		avdName = strings.TrimSpace(lines[0])
-	}
-	if avdName == "" || strings.Contains(avdName, "KO:") {
+	avdName, _ := client.GetAvdName(serial)
+	if avdName == "" {
 		installed := config.GetInstalledAvds()
 		if len(installed) == 1 {
 			avdName = installed[0]["name"]
@@ -803,27 +800,34 @@ func handleBench(client *adb.Client, args []string) {
 	// and printed a fixed "-50%" heap row and a "0x animations" row regardless of
 	// the device's real state, so the headline savings figure was computed against
 	// a number that was never measured.
-	animScale := strings.TrimSpace(mustGetSetting(client, serial, "global", "window_animation_scale"))
+	animScale := strings.TrimSpace(readSettingForDisplay(client, serial, "global", "window_animation_scale"))
 	if animScale == "" || animScale == "null" {
 		animScale = "1.0 (default)"
 	}
-	heapMb := "unknown"
-	for _, avd := range config.GetInstalledAvds() {
-		if v := avd["vm.heapSize"]; v != "" {
-			heapMb = v + " MB"
+
+	// Look up the config for the AVD this emulator is actually running. Taking
+	// the first installed AVD would report an unrelated device's RAM and heap.
+	heapMb, ramCfg := "unknown", "unknown"
+	avdName, err := client.GetAvdName(serial)
+	if err == nil {
+		for _, avd := range config.GetInstalledAvds() {
+			if !strings.EqualFold(avd["name"], avdName) {
+				continue
+			}
+			if v := avd["vm.heapSize"]; v != "" {
+				heapMb = v + " MB"
+			}
+			if v := avd["hw.ramSize"]; v != "" {
+				ramCfg = v + " MB"
+			}
 			break
 		}
-	}
-	ramCfg := "unknown"
-	for _, avd := range config.GetInstalledAvds() {
-		if v := avd["hw.ramSize"]; v != "" {
-			ramCfg = v + " MB"
-			break
-		}
+	} else {
+		avdName = serial
 	}
 
 	fmt.Printf(`════════════════════════════════════════════════════════════════════════
- ⚡ AVD-SLIM Measured State: %s
+ ⚡ AVD-SLIM Measured State: %s (%s)
 ════════════════════════════════════════════════════════════════════════
  Host memory (Activity Monitor footprint)  %d MB (%.1f GB)
  Host resident physical RAM (RSS)          %d MB (%.1f GB)
@@ -834,7 +838,7 @@ func handleBench(client *adb.Client, args []string) {
 ════════════════════════════════════════════════════════════════════════
  These are measurements of the current state, not a before/after comparison.
  To measure savings, run 'avdslim measure' before and after 'avdslim on'.
-`, serial,
+`, serial, avdName,
 		footprintMb, float64(footprintMb)/1024.0,
 		rssMb, float64(rssMb)/1024.0,
 		disabledCount, ramCfg, heapMb, animScale)
@@ -845,8 +849,9 @@ func handleBench(client *adb.Client, args []string) {
 	fmt.Println()
 }
 
-// mustGetSetting reads a guest setting for display, returning "" on failure.
-func mustGetSetting(client *adb.Client, serial, namespace, key string) string {
+// readSettingForDisplay reads a guest setting for display, returning "" on
+// failure. Nothing depends on the value, so failures are not fatal.
+func readSettingForDisplay(client *adb.Client, serial, namespace, key string) string {
 	out, err := client.Exec("-s", serial, "shell", "settings", "get", namespace, key)
 	if err != nil {
 		return ""
@@ -945,8 +950,7 @@ func handleBake(client *adb.Client, args []string) {
 	// 1. Check if an emulator for this AVD is already running. If so, kill it to ensure cold boot.
 	running, _ := client.GetRunningEmulators()
 	for _, emu := range running {
-		nameOut, _ := client.Exec("-s", emu.Serial, "emu", "avd", "name")
-		if strings.Contains(nameOut, targetAvd) {
+		if client.IsAvd(emu.Serial, targetAvd) {
 			fmt.Printf("🔄 Stopping active emulator instance (%s) for clean baking...\n", emu.Serial)
 			client.Exec("-s", emu.Serial, "emu", "kill")
 			time.Sleep(2 * time.Second)
@@ -997,8 +1001,7 @@ func handleBake(client *adb.Client, args []string) {
 	for i := 0; i < 90; i++ {
 		currentRunning, _ := client.GetRunningEmulators()
 		for _, emu := range currentRunning {
-			nameOut, _ := client.Exec("-s", emu.Serial, "emu", "avd", "name")
-			if strings.Contains(nameOut, targetAvd) {
+			if client.IsAvd(emu.Serial, targetAvd) {
 				targetSerial = emu.Serial
 				break
 			}
@@ -1133,13 +1136,8 @@ func handleSnapshot(client *adb.Client, args []string) {
 	}
 
 	// Get AVD Name
-	avdNameOut, _ := client.Exec("-s", serial, "emu", "avd", "name")
-	lines := strings.Split(strings.TrimSpace(avdNameOut), "\n")
-	avdName := ""
-	if len(lines) > 0 {
-		avdName = strings.TrimSpace(lines[0])
-	}
-	if avdName == "" || strings.Contains(avdName, "KO:") {
+	avdName, _ := client.GetAvdName(serial)
+	if avdName == "" {
 		installed := config.GetInstalledAvds()
 		if len(installed) == 1 {
 			avdName = installed[0]["name"]

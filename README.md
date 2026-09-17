@@ -28,6 +28,41 @@ machine's measurements, not a benchmark.</sub>
 
 ---
 
+## 🔧 Changes in this fork
+
+A security and correctness pass over upstream `v1.0.5`. High level:
+
+**Supply chain**
+* `install.sh` verifies the release SHA-256 against `checksums.txt` before extracting; previously it never verified anything.
+* The GitHub Action no longer pipes `install.sh` from `main` into `bash` — it runs its own copy at whatever ref you pinned.
+* All CI actions pinned to commit SHAs; releases now carry a build provenance attestation.
+* `go.mod` pointed at a **nonexistent** GitHub account, which broke `go install` and left the import path claimable by anyone. Fixed.
+
+**Data loss**
+* `tune-avd` and `restart` used to delete *every* snapshot for an AVD, unprompted — including your emulator's Quick Boot state. They now warn instead.
+* AVD names from argv are validated before reaching `os.RemoveAll`.
+* AVD directories are resolved through the `.ini` registry. Assuming `<name>.avd` silently broke `bake`, `unbake`, `restart`, `start` and golden snapshots for any AVD whose directory name differs from its name.
+
+**Behaviour**
+* **Animations are now opt-in** (`--disable-animations`). Zeroing `animator_duration_scale` changes guest behaviour and can mask or invent races in UI tests.
+* `off` records each setting's prior value and replays it, instead of writing hardcoded "stock" defaults over whatever you had.
+* The emulator shim refuses to install on Windows (it bricked the SDK) and refuses to downgrade your emulator after an SDK update.
+* Every external command is bounded by a timeout; a wedged `adb` used to hang `watch` forever.
+
+**Honesty**
+* `bench` reported savings against hardcoded constants that were never measured. Removed.
+* `on` reported memory *increases* as "Reclaimed: 0MB", and implied it could shrink the host process — it cannot; that is fixed at launch. See the callout under [The Solution](#-the-solution).
+* `off` and `make install` claimed success when they had done nothing.
+* Dropped unverifiable "100% guaranteed" claims and the "<1.5s instant boot" figure (measured: ~13s end-to-end).
+
+**Tests & CI**
+* First tests in the repo (69 subtests) plus a CI workflow — previously nothing ran on a pull request.
+* Every command exercised against a real SDK and emulator, which is how most of the above was found.
+
+See `git log` for per-change detail and rationale.
+
+---
+
 ## 🛡️ What It Touches, and What It Doesn't
 
 The #1 fear with debloating tools is silent breakage. Here is what `avdslim`
@@ -152,54 +187,56 @@ Just like `simslim` silences iOS simulators via `launchctl`, `avdslim`:
 
 ## 🚀 Installation
 
-### Option 1: Homebrew (recommended)
+> **⚠️ Only building from source gets the changes above.**
+> The newest published release is `v1.0.5`, which predates all of them. Every
+> install method that downloads a release artifact — Homebrew, `install.sh`,
+> `go install @latest`, the pre-built tarballs — delivers the **unfixed** binary.
+> Those options are struck through below until a release is cut from this branch.
 
-The formula pins a SHA-256 for each artifact, so Homebrew verifies the download
-for you.
+### Build from source ✅
 
-```bash
-brew tap kdbhalala/avdslim https://github.com/kdbhalala/avdslim.git
-brew install avdslim
-```
-
-### Option 2: Install script
-
-`install.sh` downloads `checksums.txt` from the same release and verifies the
-tarball's SHA-256 before extracting anything, aborting on mismatch.
-
-Prefer fetching the script at a tag and reading it before you run it, rather
-than piping a moving branch straight into a shell:
-
-```bash
-curl -fsSLO https://raw.githubusercontent.com/kdbhalala/avdslim/v1.0.5/install.sh
-less install.sh          # read it
-bash install.sh
-```
-
-Releases also carry a build provenance attestation, which you can verify
-independently of the checksum:
-
-```bash
-gh attestation verify avdslim_v1.0.5_darwin_arm64.tar.gz --repo kdbhalala/avdslim
-```
-
-### Option 3: Go Install
-```bash
-go install github.com/kdbhalala/avdslim/cmd/avdslim@latest
-```
-
-### Option 4: Pre-built Binaries
-Download pre-compiled binaries from [GitHub Releases](https://github.com/kdbhalala/avdslim/releases):
-* macOS Apple Silicon: `avdslim_*_darwin_arm64.tar.gz`
-* macOS Intel: `avdslim_*_darwin_amd64.tar.gz`
-* Linux: `avdslim_*_linux_amd64.tar.gz` / `avdslim_*_linux_arm64.tar.gz`
-
-### Option 5: Build from Source (100% Stdlib, Zero Dependencies)
 ```bash
 git clone https://github.com/kdbhalala/avdslim.git
 cd avdslim
-make install
+make install          # → ~/.local/bin/avdslim
 ```
+
+Zero dependencies (`go.mod` has no `require` block), so this needs only a Go
+toolchain. Override the destination with `make install PREFIX=/opt/homebrew/bin`.
+
+---
+
+### ~~Option 1: Homebrew~~
+
+~~The formula pins a SHA-256 for each artifact, so Homebrew verifies the download for you.~~
+
+> ~~`brew tap kdbhalala/avdslim …` && `brew install avdslim`~~ — the formula pins
+> `v1.0.5` checksums, so this installs the pre-fix binary.
+
+### ~~Option 2: Install script~~
+
+~~`install.sh` downloads `checksums.txt` from the same release and verifies the tarball's SHA-256 before extracting anything, aborting on mismatch.~~
+
+> The *script* in this branch is the hardened one, but there is no release for it
+> to fetch — pointing it at `v1.0.5` downloads the pre-fix binary. It also cannot
+> verify a provenance attestation, because `v1.0.5` was published before
+> attestations were added.
+
+### ~~Option 3: Go Install~~
+
+~~`go install github.com/kdbhalala/avdslim/cmd/avdslim@latest`~~
+
+> This *would* now work — the module path was broken upstream and is fixed here —
+> but `@latest` resolves to `v1.0.5`, which predates the fix, so the command still
+> fails. Working once a release is tagged from this branch.
+
+### ~~Option 4: Pre-built Binaries~~
+
+~~Download pre-compiled binaries from GitHub Releases.~~
+
+> All published tarballs are `v1.0.5` and report their version as `1.0.5`
+> regardless of tag (that bug is fixed here, but only in binaries built from this
+> branch).
 
 ---
 
@@ -428,11 +465,21 @@ Slash CI runner memory and run parallel emulator shards on free GitHub Actions r
 
 ```yaml
 - name: AVD-SLIM — Android Emulator RAM & CI Optimizer
-  uses: kdbhalala/avdslim@v1
+  uses: kdbhalala/avdslim@<commit-sha>   # pin a SHA, not a tag
   with:
     ram: '1024'
-    install-shim: 'true'
+    install-shim: 'false'   # 'true' mutates the runner's SDK in place
 ```
+
+> **⚠️ Do not use `@v1`.** That tag predates this branch, so it still pipes
+> `install.sh` from `main` into `bash` — meaning any push to `main` becomes
+> arbitrary code execution in your CI job, with your `GITHUB_TOKEN` and secrets in
+> scope. Pin a commit SHA containing these changes.
+>
+> `install-shim: 'true'` modifies the SDK in place. Fine on an ephemeral runner;
+> on a **self-hosted** runner the change outlives the job and affects every later
+> build on that machine. `watch: true` modifies every emulator that boots,
+> including ones under test.
 
 ---
 

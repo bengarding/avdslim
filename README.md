@@ -5,7 +5,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Go Report Card](https://goreportcard.com/badge/github.com/kdbhalala/avdslim)](https://goreportcard.com/report/github.com/kdbhalala/avdslim)
-[![Release](https://img.shields.io/github/v/release/kdbhalala/avdslim)](https://github.com/kdbhalala/avdslim/releases)
+[![Fork](https://img.shields.io/badge/fork-bengarding%2Favdslim-blue)](https://github.com/bengarding/avdslim/tree/security-hardening)
+[![Upstream release](https://img.shields.io/github/v/release/kdbhalala/avdslim?label=upstream%20release)](https://github.com/kdbhalala/avdslim/releases)
 [![GitHub Marketplace](https://img.shields.io/badge/Marketplace-AVD--SLIM-blue?logo=github-actions&logoColor=white)](https://github.com/marketplace/actions/avd-slim-android-emulator-ram-ci-optimizer)
 
 `avdslim` is a lightweight, zero-dependency CLI tool that cuts Android Virtual Device (AVD) host memory consumption — on one measured Apple Silicon setup, from **~8.5 GB to ~2.5 GB** of Activity Monitor footprint (**~6.5 GB to ~1.5 GB** of dirty RAM) — and reduces idle CPU overhead, on Apple Silicon & Linux.
@@ -195,14 +196,24 @@ Just like `simslim` silences iOS simulators via `launchctl`, `avdslim`:
 
 ### Build from source ✅
 
+The changes live on the `security-hardening` branch of the fork. Cloning
+upstream, or this fork's `main`, gets you the unmodified `v1.0.5` code.
+
 ```bash
-git clone https://github.com/kdbhalala/avdslim.git
+git clone -b security-hardening https://github.com/bengarding/avdslim.git
 cd avdslim
 make install          # → ~/.local/bin/avdslim
 ```
 
 Zero dependencies (`go.mod` has no `require` block), so this needs only a Go
 toolchain. Override the destination with `make install PREFIX=/opt/homebrew/bin`.
+
+Verify you got the right build — `avdslim on` should say animations were left
+alone rather than reporting them disabled:
+
+```bash
+avdslim version && avdslim on --help 2>/dev/null | grep -i animations
+```
 
 ---
 
@@ -465,16 +476,17 @@ Slash CI runner memory and run parallel emulator shards on free GitHub Actions r
 
 ```yaml
 - name: AVD-SLIM — Android Emulator RAM & CI Optimizer
-  uses: kdbhalala/avdslim@<commit-sha>   # pin a SHA, not a tag
+  uses: bengarding/avdslim@<commit-sha>   # pin a SHA from security-hardening
   with:
     ram: '1024'
     install-shim: 'false'   # 'true' mutates the runner's SDK in place
 ```
 
-> **⚠️ Do not use `@v1`.** That tag predates this branch, so it still pipes
-> `install.sh` from `main` into `bash` — meaning any push to `main` becomes
-> arbitrary code execution in your CI job, with your `GITHUB_TOKEN` and secrets in
-> scope. Pin a commit SHA containing these changes.
+> **⚠️ Do not use `kdbhalala/avdslim@v1`.** That tag predates this branch, so it
+> still pipes `install.sh` from `main` into `bash` — meaning any push to that
+> `main` becomes arbitrary code execution in your CI job, with your
+> `GITHUB_TOKEN` and secrets in scope. Pin a commit SHA from
+> `bengarding/avdslim@security-hardening` until these changes land upstream.
 >
 > `install-shim: 'true'` modifies the SDK in place. Fine on an ephemeral runner;
 > on a **self-hosted** runner the change outlives the job and affects every later

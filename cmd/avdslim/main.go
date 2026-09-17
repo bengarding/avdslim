@@ -12,15 +12,19 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/krunalbhalala/avdslim/internal/adb"
-	"github.com/krunalbhalala/avdslim/internal/bloat"
-	"github.com/krunalbhalala/avdslim/internal/config"
-	"github.com/krunalbhalala/avdslim/internal/doctor"
-	"github.com/krunalbhalala/avdslim/internal/host"
-	"github.com/krunalbhalala/avdslim/internal/shim"
+	"github.com/kdbhalala/avdslim/internal/adb"
+	"github.com/kdbhalala/avdslim/internal/bloat"
+	"github.com/kdbhalala/avdslim/internal/config"
+	"github.com/kdbhalala/avdslim/internal/doctor"
+	"github.com/kdbhalala/avdslim/internal/host"
+	"github.com/kdbhalala/avdslim/internal/shim"
 )
 
-const version = "1.0.5"
+// version must be a var, not a const: the Makefile and release workflow both
+// build with -ldflags "-X main.version=<tag>", and the linker can only overwrite
+// a string variable. As a const the injection was silently ignored, so every
+// released binary reported 1.0.5 no matter which tag it was built from.
+var version = "1.0.5"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -93,25 +97,33 @@ Commands:
   on [device]          Slim down emulator: disable bloat daemons & trim RAM
                        Options: --aggressive (also disables Play Store updater)
                                 --keep=<package> (preserve specific package, e.g. Maps)
-  restore, off         Instant 100%% stock restore (re-enables packages, animations & sync)
+                                --disable-animations (opt-in; zeroes animation
+                                  scales — affects UI-test timing, off by default)
+  restore, off         Revert what avdslim changed: re-enable the packages it
+                       disabled and put settings back to their recorded values
+                       (requires the state file written by 'on')
   watch                Auto-detect & slim new emulators as soon as they boot
-                       Options: --aggressive, --keep=<package>
+                       Options: --aggressive, --keep=<package>, --disable-animations
+                       ⚠️  Modifies every emulator that boots, incl. under test
   tune-avd [avd_name]  Tune host AVD config.ini (RAM=1024M, Metal GPU, no cameras)
                        Options: --ram=<MB> (default: 1024), --heap=<MB> (default: 256)
   start, run, launch [avd] Launch AVD with low-memory host flags & auto-slim upon boot
                        Options: --no-slim, --no-lowram, --headless, --cold, --ram=<MB> (default: 1024)
   stop, kill [device]  Gracefully shut down emulator (Options: --snap, -f)
-  bake [avd_name]      Create local Golden Snapshot (pruned & slimmed) for ~1.5s instant boots
+  bake [avd_name]      Create local Golden Snapshot (pruned & slimmed) to skip cold boots
                        Options: --ram=<MB> (default: 1024), --aggressive, --headless, --live
   snapshot, snap       Capture running emulator (with pre-installed apps & test logins)
-                       into Golden Snapshot for instant <1.5s restores
+                       into a Golden Snapshot to resume from later
   unbake [avd_name]    Delete Golden Snapshot and return AVD to stock cold boots
-  bench [device]       Show before/after memory & CPU efficiency scoreboard
+  bench [device]       Show measured current memory state (not a before/after
+                       comparison — use 'measure' before and after 'on' for that)
   install-shim         Wrap SDK emulator binary so Android Studio launches stay slim
                        Options: --ram=<MB> (default: 1024)
+                       Note: modifies the SDK in place; not supported on Windows
   uninstall-shim       Restore stock Android SDK emulator binary
   doctor               Audit environment, AVDs, system image 16K overhead & toolchain
-  profiles             List all bloat categories, packages & guaranteed-working services
+  profiles             List bloat categories, packages, what is never disabled
+                       and the caveats that apply
   version              Print avdslim version
 
 Examples:
@@ -121,6 +133,7 @@ Examples:
   avdslim measure
   avdslim on --aggressive
   avdslim on --keep=com.google.android.apps.maps
+  avdslim on --disable-animations
   avdslim tune-avd Pixel_10_Pro --ram=1024
   avdslim restart
 `, version)
@@ -207,37 +220,70 @@ func handleMeasure(client *adb.Client, args []string) {
 	host.PrintGuestMeminfo(out)
 }
 
-func handleOn(client *adb.Client, args []string) {
-	aggressive := false
-	filteredArgs := make([]string, 0, len(args))
-	var keepPackages []string
+// parseSlimOptions extracts the flags controlling what Slim changes on a guest.
+// Shared by on/watch/launch/bake/snapshot so a flag means the same thing
+// everywhere.
+func parseSlimOptions(args []string) adb.SlimOptions {
+	var opts adb.SlimOptions
 	for _, a := range args {
-		if a == "--aggressive" {
-			aggressive = true
-		} else if strings.HasPrefix(a, "--keep=") {
-			pkg := strings.TrimPrefix(a, "--keep=")
-			if pkg != "" {
-				keepPackages = append(keepPackages, pkg)
+		switch {
+		case a == "--aggressive":
+			opts.Aggressive = true
+		case a == "--disable-animations" || a == "--no-animations":
+			opts.DisableAnimations = true
+		case strings.HasPrefix(a, "--keep="):
+			if pkg := strings.TrimPrefix(a, "--keep="); pkg != "" {
+				opts.KeepPackages = append(opts.KeepPackages, pkg)
 			}
-		} else {
-			filteredArgs = append(filteredArgs, a)
 		}
 	}
+	return opts
+}
 
-	serial, err := client.ResolveDevice(filteredArgs)
+// slimFlagsFrom keeps only the flags that Slim cares about, so a parent command
+// can forward them to handleOn without leaking its own flags (--ram=, --cold…).
+func slimFlagsFrom(args []string) []string {
+	var out []string
+	for _, a := range args {
+		switch {
+		case a == "--aggressive",
+			a == "--disable-animations",
+			a == "--no-animations",
+			strings.HasPrefix(a, "--keep="):
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// positionalArgs drops flags, leaving device serials / AVD names.
+func positionalArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func handleOn(client *adb.Client, args []string) {
+	opts := parseSlimOptions(args)
+
+	serial, err := client.ResolveDevice(positionalArgs(args))
 	if err != nil {
 		fmt.Printf("❌ %v\n", err)
 		return
 	}
 
 	presetName := "Standard"
-	if aggressive {
+	if opts.Aggressive {
 		presetName = "Aggressive"
 	}
 	fmt.Printf("⚡ Slimming Android Emulator (%s) [preset: %s]...\n\n", serial, presetName)
 
-	if len(keepPackages) > 0 {
-		fmt.Printf("   Preserving requested package(s): %s\n", strings.Join(keepPackages, ", "))
+	if len(opts.KeepPackages) > 0 {
+		fmt.Printf("   Preserving requested package(s): %s\n", strings.Join(opts.KeepPackages, ", "))
 	}
 
 	hostPid := host.FindHostPidForSerial(serial)
@@ -249,10 +295,14 @@ func handleOn(client *adb.Client, args []string) {
 	}
 
 	fmt.Println("1. Disabling non-essential background daemons:")
-	count, _ := client.Slim(serial, aggressive, keepPackages)
+	count, _ := client.Slim(serial, opts)
 	fmt.Printf("   -> Successfully disabled %d packages.\n\n", count)
 
-	fmt.Println("2. Tuned system settings (animations 0x, background limit 4, sync off).")
+	if opts.DisableAnimations {
+		fmt.Println("2. Tuned system settings (animations 0x, background limit 4, sync off).")
+	} else {
+		fmt.Println("2. Tuned system settings (background limit 4, sync off; animations left alone).")
+	}
 	fmt.Println("3. Purged cached processes and trimmed memory.")
 	fmt.Println()
 
@@ -266,20 +316,57 @@ func handleOn(client *adb.Client, args []string) {
 	}
 
 	fmt.Println("══════════════════════════════════════════════════════════════")
-	fmt.Printf("🎉 Slimming complete for %s!\n", serial)
+	fmt.Printf("🎉 Guest slimming complete for %s!\n", serial)
 	if beforeFootprint > 0 && afterFootprint > 0 {
-		diffFp := beforeFootprint - afterFootprint
-		if diffFp < 0 {
-			diffFp = 0
-		}
-		diffRss := beforeRss - afterRss
-		if diffRss < 0 {
-			diffRss = 0
-		}
-		fmt.Printf("🖥️  Activity Monitor Memory: %dMB -> %dMB (Reclaimed: %dMB)\n", beforeFootprint, afterFootprint, diffFp)
-		fmt.Printf("🖥️  Host Resident RAM (RSS): %dMB -> %dMB (Reclaimed: %dMB)\n", beforeRss, afterRss, diffRss)
+		// Report the signed change. Clamping negatives to zero and labelling the
+		// result "Reclaimed: 0MB" presented a memory *increase* as a neutral
+		// outcome — on a real run RSS went 359MB -> 1752MB and this still said 0.
+		fmt.Printf("🖥️  Activity Monitor Memory: %dMB -> %dMB (%s)\n",
+			beforeFootprint, afterFootprint, describeDelta(beforeFootprint, afterFootprint))
+		fmt.Printf("🖥️  Host Resident RAM (RSS): %dMB -> %dMB (%s)\n",
+			beforeRss, afterRss, describeDelta(beforeRss, afterRss))
+		fmt.Println("   Measured seconds after slimming, while the guest is still")
+		fmt.Println("   restarting services, so it usually reads high.")
 	}
-	fmt.Printf("ℹ️  To restore default stock services anytime:\n   avdslim off %s\n\n", serial)
+
+	// The headline "8GB -> 1.5GB" number comes from launching with -memory /
+	// -lowram / -gpu, none of which `on` can do: QEMU sizes the guest's RAM and
+	// its GPU buffers once, at startup. `on` only changes the guest — packages,
+	// settings, caches — so expecting Activity Monitor to drop after running it
+	// leads to exactly the "it's still showing 6.8GB" confusion.
+	fmt.Println()
+	fmt.Println("ℹ️  This reduced work INSIDE the guest, not the host process size.")
+	fmt.Println("   Activity Monitor reflects flags QEMU was started with (-memory,")
+	fmt.Println("   -lowram, -gpu), which cannot change while the emulator runs.")
+	if !launchedByAvdslim(hostPid) {
+		fmt.Println()
+		fmt.Println("   This emulator was NOT started with low-memory flags. To actually")
+		fmt.Println("   cut host RAM you have to relaunch it:")
+		if avdName, err := client.GetAvdName(serial); err == nil && avdName != "" {
+			fmt.Printf("     avdslim tune-avd %s --ram=1024   # persist RAM + GPU in config.ini\n", avdName)
+			fmt.Printf("     avdslim restart %s               # relaunch with those flags\n", serial)
+		} else {
+			fmt.Println("     avdslim tune-avd <avd> --ram=1024")
+			fmt.Println("     avdslim restart")
+		}
+		fmt.Println("   Or run `avdslim install-shim` so Android Studio's Play button")
+		fmt.Println("   launches with them automatically.")
+	}
+	fmt.Printf("\nℹ️  To restore default stock services anytime:\n   avdslim off %s\n\n", serial)
+}
+
+// launchedByAvdslim reports whether the emulator process was started with the
+// low-memory flags, so `on` can tell the user whether a relaunch is what they
+// actually need.
+func launchedByAvdslim(hostPid int) bool {
+	if hostPid <= 0 {
+		return false
+	}
+	out, err := host.RunProbe("ps", "-p", strconv.Itoa(hostPid), "-o", "command=")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "-lowram")
 }
 
 func handleOff(client *adb.Client, args []string) {
@@ -291,9 +378,24 @@ func handleOff(client *adb.Client, args []string) {
 
 	fmt.Printf("🔄 Restoring default services for %s...\n\n", serial)
 	fmt.Println("1. Re-enabling packages:")
-	count, _ := client.Restore(serial)
+	count, hadState, _ := client.Restore(serial)
+
+	// Without a state file nothing was reverted, so say that plainly instead of
+	// printing "Restored 0 packages" followed by a success banner.
+	if !hadState {
+		fmt.Printf("\nℹ️  Nothing to restore for %s — avdslim has no record of changing it.\n", serial)
+		fmt.Println("   If you slimmed it with an older build, re-run `avdslim on` then `off`.")
+		fmt.Println()
+		return
+	}
+
 	fmt.Printf("   -> Restored %d packages.\n\n", count)
-	fmt.Println("2. Restored default system settings (animations 1.0x, auto-sync on).")
+	// Do not restate what was restored here. Restore() prints the actual per-key
+	// result, and this line used to claim "animations 1.0x, auto-sync on"
+	// unconditionally — contradicting the lines immediately above it, which
+	// correctly reported that animations were never touched and that auto-sync had
+	// been unset rather than enabled.
+	fmt.Println("2. Guest settings returned to their recorded prior values (see above).")
 	fmt.Printf("✅ Successfully restored %s to stock configuration.\n\n", serial)
 }
 
@@ -467,7 +569,7 @@ func handleLaunch(client *adb.Client, args []string) {
 	hasGolden := config.HasGoldenSnapshot(avdName)
 	if hasGolden && !forceCold {
 		emuArgs = append(emuArgs, "-snapshot", "avdslim_clean", "-no-snapshot-save")
-		fmt.Printf("✨ Golden Snapshot detected! Restoring instant clean state (< 1.5s boot)...\n")
+		fmt.Printf("✨ Golden Snapshot detected! Resuming the saved clean image instead of cold-booting...\n")
 	} else {
 		emuArgs = append(emuArgs, "-no-snapshot-load")
 	}
@@ -486,29 +588,107 @@ func handleLaunch(client *adb.Client, args []string) {
 
 	if doSlim {
 		fmt.Println("⏳ Waiting for emulator to finish booting...")
-		_, _ = client.Exec("wait-for-device")
+
+		// Every adb call here must name the device. Without -s, adb fails with
+		// "more than one device/emulator" whenever another emulator is already
+		// running, so getprop never returned 1, the loop always ran its full
+		// 120s and reported a bogus timeout, and the follow-up handleOn could not
+		// resolve a device either. `avdslim start` was broken outright for anyone
+		// with a second emulator open.
+		// Wall-clock deadline, not an iteration count. Each pass makes adb calls
+		// whose duration is not fixed, so "60 iterations of a 2s sleep" was not
+		// 120 seconds and the timeout message was not true.
+		const bootTimeout = 120 * time.Second
+		deadline := time.Now().Add(bootTimeout)
 
 		booted := false
-		for i := 0; i < 60; i++ {
-			res, _ := client.Exec("shell", "getprop", "sys.boot_completed")
-			if strings.TrimSpace(res) == "1" {
-				booted = true
-				break
+		serial := ""
+		for time.Now().Before(deadline) {
+			if serial == "" {
+				serial = findSerialForAvd(client, avdName)
+			}
+			if serial != "" {
+				res, _ := client.Exec("-s", serial, "shell", "getprop", "sys.boot_completed")
+				if strings.TrimSpace(res) == "1" {
+					booted = true
+					break
+				}
 			}
 			time.Sleep(2 * time.Second)
 		}
 
 		if booted {
+			// Forward the slim-related flags. Passing nil here dropped
+			// --aggressive/--keep=/--disable-animations, so `start --aggressive`
+			// silently applied the Standard preset instead.
+			slimArgs := append([]string{serial}, slimFlagsFrom(options)...)
 			if hasGolden && !forceCold {
 				fmt.Println("✓ Instant boot complete via Golden Snapshot! Refreshing slim state...")
-				handleOn(client, nil)
 			} else {
 				fmt.Println("✓ Boot complete! Applying avdslim optimizations...")
-				handleOn(client, nil)
 			}
+			handleOn(client, slimArgs)
 		} else {
 			fmt.Println("⚠️  Boot timed out after 120s. You can run `avdslim on` manually.")
 		}
+	}
+}
+
+// findSerialForAvd returns the serial of the running emulator hosting avdName,
+// or "" if none is up yet. Used instead of bare adb calls so a second running
+// emulator cannot make adb ambiguous.
+//
+// Uses ListEmulatorSerials rather than GetRunningEmulators: the latter costs five
+// adb invocations per device, including `adb shell` calls that stall while a
+// device is still booting. Only serials already in the "device" state are asked
+// for their AVD name, since the console is not up before that.
+func findSerialForAvd(client *adb.Client, avdName string) string {
+	attached, err := client.ListEmulatorSerials()
+	if err != nil {
+		return ""
+	}
+	for _, emu := range attached {
+		if emu.State != "device" {
+			continue
+		}
+		if client.IsAvd(emu.Serial, avdName) {
+			return emu.Serial
+		}
+	}
+	return ""
+}
+
+// waitForEmulatorGone polls adb until serial disappears from the device list,
+// which is authoritative. Returns false if it is still listed when the deadline
+// passes, so callers can report honestly instead of claiming a clean shutdown.
+//
+// Two things this deliberately does not do. It does not poll
+// host.FindHostPidForSerial, which returns 0 both for "gone" and for "cannot
+// identify" — that made the old loops exit on their first iteration and print
+// "stopped cleanly" regardless. And it does not call GetRunningEmulators, whose
+// per-device getprop/cat calls run `adb shell` against an emulator that is in the
+// middle of dying, precisely when those calls hang; with a 30s bound each, a
+// nominally 15-second wait could have run for minutes.
+func waitForEmulatorGone(client *adb.Client, serial string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		attached, err := client.ListEmulatorSerials()
+		if err == nil {
+			present := false
+			for _, emu := range attached {
+				if emu.Serial == serial {
+					present = true
+					break
+				}
+			}
+			if !present {
+				return true
+			}
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(1 * time.Second)
 	}
 }
 
@@ -539,8 +719,7 @@ func handleStop(client *adb.Client, args []string) {
 		} else {
 			fmt.Println("📱 Running Emulators:")
 			for i, emu := range running {
-				nameOut, _ := client.Exec("-s", emu.Serial, "emu", "avd", "name")
-				name := strings.TrimSpace(strings.Split(nameOut, "\n")[0])
+				name, _ := client.GetAvdName(emu.Serial)
 				fmt.Printf("   [%d] %s (%s)\n", i+1, emu.Serial, name)
 			}
 			fmt.Print("\nSelect an emulator to stop (number): ")
@@ -555,8 +734,7 @@ func handleStop(client *adb.Client, args []string) {
 		}
 	}
 
-	avdNameOut, _ := client.Exec("-s", serial, "emu", "avd", "name")
-	avdName := strings.TrimSpace(strings.Split(avdNameOut, "\n")[0])
+	avdName, _ := client.GetAvdName(serial)
 	if avdName == "" {
 		avdName = serial
 	}
@@ -580,13 +758,11 @@ func handleStop(client *adb.Client, args []string) {
 	fmt.Printf("🛑 Gracefully shutting down %s (%s)...\n", serial, avdName)
 	client.Exec("-s", serial, "emu", "kill")
 
-	for i := 0; i < 10; i++ {
-		time.Sleep(1 * time.Second)
-		if pid := host.FindHostPidForSerial(serial); pid == 0 {
-			break
-		}
+	if waitForEmulatorGone(client, serial, 15*time.Second) {
+		fmt.Println("✓ Emulator process stopped cleanly.")
+	} else {
+		fmt.Printf("⚠️  %s is still listed by adb after 15s; it may be shutting down slowly.\n", serial)
 	}
-	fmt.Println("✓ Emulator process stopped cleanly.")
 	fmt.Println()
 }
 
@@ -597,13 +773,8 @@ func handleRestart(client *adb.Client, args []string) {
 		return
 	}
 
-	avdNameOut, _ := client.Exec("-s", serial, "emu", "avd", "name")
-	lines := strings.Split(strings.TrimSpace(avdNameOut), "\n")
-	avdName := ""
-	if len(lines) > 0 {
-		avdName = strings.TrimSpace(lines[0])
-	}
-	if avdName == "" || strings.Contains(avdName, "KO:") {
+	avdName, _ := client.GetAvdName(serial)
+	if avdName == "" {
 		installed := config.GetInstalledAvds()
 		if len(installed) == 1 {
 			avdName = installed[0]["name"]
@@ -617,21 +788,26 @@ func handleRestart(client *adb.Client, args []string) {
 	fmt.Printf("🔄 Gracefully shutting down %s (%s)...\n", serial, avdName)
 	client.Exec("-s", serial, "emu", "kill")
 
-	for i := 0; i < 10; i++ {
-		time.Sleep(1 * time.Second)
-		if pid := host.FindHostPidForSerial(serial); pid == 0 {
-			break
-		}
+	if waitForEmulatorGone(client, serial, 15*time.Second) {
+		fmt.Println("✓ Emulator process stopped.")
+	} else {
+		fmt.Printf("⚠️  %s is still listed by adb after 15s; relaunching anyway may fail.\n", serial)
 	}
-	fmt.Println("✓ Emulator process stopped.")
 
-	// Purge stale runtime cache & snapshots
-	home, _ := os.UserHomeDir()
-	avdDir := filepath.Join(home, ".android", "avd", avdName+".avd")
+	// Purge only the stale runtime cache. `restart` used to os.RemoveAll the
+	// entire snapshots/ directory, destroying every snapshot for this AVD —
+	// including ones the user took themselves, and the golden snapshot that
+	// `stop --snap` had just offered to create — with no prompt and no undo.
+	// avdName here comes from emulator console output, so it is validated
+	// before being turned into a path.
+	avdDir, err := config.AvdDir(avdName)
+	if err != nil {
+		fmt.Printf("❌ %v\n", err)
+		return
+	}
 	_ = os.Remove(filepath.Join(avdDir, "hardware-qemu.ini"))
 	_ = os.Remove(filepath.Join(avdDir, "hardware-qemu.ini.lock"))
-	_ = os.RemoveAll(filepath.Join(avdDir, "snapshots"))
-	fmt.Println("✓ Purged stale hardware-qemu.ini and snapshots.")
+	fmt.Println("✓ Purged stale hardware-qemu.ini (snapshots left intact).")
 
 	launchArgs := []string{avdName, "--slim"}
 	for _, a := range args {
@@ -647,31 +823,24 @@ func findEmulator() string {
 }
 
 func handleWatch(client *adb.Client, args []string) {
-	aggressive := false
-	var keepPackages []string
-	for _, a := range args {
-		if a == "--aggressive" {
-			aggressive = true
-		} else if strings.HasPrefix(a, "--keep=") {
-			pkg := strings.TrimPrefix(a, "--keep=")
-			if pkg != "" {
-				keepPackages = append(keepPackages, pkg)
-			}
-		}
-	}
+	opts := parseSlimOptions(args)
 
 	preset := "Standard"
-	if aggressive {
+	if opts.Aggressive {
 		preset = "Aggressive"
 	}
 
 	fmt.Println("👀 AVD-SLIM Watcher active...")
 	fmt.Printf("   Preset: %s\n", preset)
-	if len(keepPackages) > 0 {
-		fmt.Printf("   Preserving packages: %s\n", strings.Join(keepPackages, ", "))
+	if len(opts.KeepPackages) > 0 {
+		fmt.Printf("   Preserving packages: %s\n", strings.Join(opts.KeepPackages, ", "))
+	}
+	if opts.DisableAnimations {
+		fmt.Println("   Animations: will be disabled on each emulator")
 	}
 	fmt.Println("   Monitoring for newly booted Android emulators in the background.")
 	fmt.Println("   Will automatically apply low-memory optimizations as soon as emulators boot.")
+	fmt.Println("   ⚠️  This modifies EVERY emulator that boots, including ones under test.")
 	fmt.Println("   Press Ctrl+C to stop.")
 	fmt.Println()
 
@@ -688,20 +857,35 @@ func handleWatch(client *adb.Client, args []string) {
 			fmt.Println("\n👋 Stopping AVD-SLIM watcher. Goodbye!")
 			return
 		case <-ticker.C:
-			emulators, err := client.GetRunningEmulators()
+			// Cheap poll: one `adb devices` call. GetRunningEmulators would cost
+			// five adb invocations per device on every tick, forever, including
+			// for devices already slimmed and skipped below.
+			attached, err := client.ListEmulatorSerials()
 			if err != nil {
 				continue
 			}
 
 			// Clean up devices that were turned off / disconnected
 			currentMap := make(map[string]bool)
-			for _, emu := range emulators {
-				currentMap[emu.Serial] = true
+			for _, a := range attached {
+				currentMap[a.Serial] = true
 			}
 			for serial := range slimmedDevices {
 				if !currentMap[serial] {
 					delete(slimmedDevices, serial)
 				}
+			}
+
+			// Only devices we have not already handled get the expensive checks.
+			var emulators []adb.RunningEmulator
+			for _, a := range attached {
+				if a.State != "device" || slimmedDevices[a.Serial] {
+					continue
+				}
+				emulators = append(emulators, adb.RunningEmulator{
+					Serial:    a.Serial,
+					IsSlimmed: client.HasSlimState(a.Serial),
+				})
 			}
 
 			for _, emu := range emulators {
@@ -718,7 +902,7 @@ func handleWatch(client *adb.Client, args []string) {
 				}
 
 				fmt.Printf("\n✨ [%s] Emulator booted! Automatically applying avdslim...\n", emu.Serial)
-				count, _ := client.Slim(emu.Serial, aggressive, keepPackages)
+				count, _ := client.Slim(emu.Serial, opts)
 				fmt.Printf("✓ [%s] Successfully slimmed! Disabled %d packages, trimmed RAM.\n\n", emu.Serial, count)
 				slimmedDevices[emu.Serial] = true
 			}
@@ -751,32 +935,81 @@ func handleBench(client *adb.Client, args []string) {
 		}
 	}
 
-	baselineFp := 5600
-	baselineRss := 2800
-
-	fpSavingPct := 0
-	if footprintMb > 0 && footprintMb < baselineFp {
-		fpSavingPct = int(((float64(baselineFp) - float64(footprintMb)) / float64(baselineFp)) * 100)
+	// Read the values actually in effect rather than asserting them. The previous
+	// version compared against hardcoded 5600/2800 MB "stock baseline" constants
+	// and printed a fixed "-50%" heap row and a "0x animations" row regardless of
+	// the device's real state, so the headline savings figure was computed against
+	// a number that was never measured.
+	animScale := strings.TrimSpace(readSettingForDisplay(client, serial, "global", "window_animation_scale"))
+	if animScale == "" || animScale == "null" {
+		animScale = "1.0 (default)"
 	}
-	rssSavingPct := 0
-	if rssMb > 0 && rssMb < baselineRss {
-		rssSavingPct = int(((float64(baselineRss) - float64(rssMb)) / float64(baselineRss)) * 100)
+
+	// Look up the config for the AVD this emulator is actually running. Taking
+	// the first installed AVD would report an unrelated device's RAM and heap.
+	heapMb, ramCfg := "unknown", "unknown"
+	avdName, err := client.GetAvdName(serial)
+	if err == nil {
+		for _, avd := range config.GetInstalledAvds() {
+			if !strings.EqualFold(avd["name"], avdName) {
+				continue
+			}
+			if v := avd["vm.heapSize"]; v != "" {
+				heapMb = v + " MB"
+			}
+			if v := avd["hw.ramSize"]; v != "" {
+				ramCfg = v + " MB"
+			}
+			break
+		}
+	} else {
+		avdName = serial
 	}
 
 	fmt.Printf(`════════════════════════════════════════════════════════════════════════
- ⚡ AVD-SLIM Live Efficiency Scoreboard: %s
+ ⚡ AVD-SLIM Measured State: %s (%s)
 ════════════════════════════════════════════════════════════════════════
- Metric                      Stock Baseline    AVD-SLIM (Current)   Savings
- ───────────────────────────────────────────────────────────────────────
- Host Memory (Footprint)     5,600 MB (5.6 GB) %5d MB (%3.1f GB)   -%d%% ⚡
- Physical Resident RAM (RSS) 2,800 MB (2.8 GB) %5d MB (%3.1f GB)   -%d%% ⚡
- Disabled Background Bloat   0 packages        %2d packages disabled
- Dalvik / ART Heap Ceiling   512 MB            256 MB (Compact)    -50%%
- Display Animations / Churn  1.0x Scale        0x (Zero GPU Churn)  100%%
- ───────────────────────────────────────────────────────────────────────
- 🛡️  Fidelity: 100%% FCM Push, Firebase Auth, WebView & Sockets Guaranteed
+ Host memory (Activity Monitor footprint)  %d MB (%.1f GB)
+ Host resident physical RAM (RSS)          %d MB (%.1f GB)
+ Disabled packages on device               %d
+ Configured guest RAM (config.ini)         %s
+ Configured Dalvik/ART heap (config.ini)   %s
+ window_animation_scale                    %s
 ════════════════════════════════════════════════════════════════════════
-`, serial, footprintMb, float64(footprintMb)/1024.0, fpSavingPct, rssMb, float64(rssMb)/1024.0, rssSavingPct, disabledCount)
+ These are measurements of the current state, not a before/after comparison.
+ To measure savings, run 'avdslim measure' before and after 'avdslim on'.
+`, serial, avdName,
+		footprintMb, float64(footprintMb)/1024.0,
+		rssMb, float64(rssMb)/1024.0,
+		disabledCount, ramCfg, heapMb, animScale)
+
+	if disabledCount == 0 {
+		fmt.Println(" ℹ️  No disabled packages found — this emulator looks un-slimmed.")
+	}
+	fmt.Println()
+}
+
+// describeDelta renders a before/after memory pair as a signed change, so an
+// increase reads as an increase rather than as zero reclaimed.
+func describeDelta(before, after int) string {
+	switch {
+	case after < before:
+		return fmt.Sprintf("reclaimed %dMB", before-after)
+	case after > before:
+		return fmt.Sprintf("INCREASED by %dMB", after-before)
+	default:
+		return "no change"
+	}
+}
+
+// readSettingForDisplay reads a guest setting for display, returning "" on
+// failure. Nothing depends on the value, so failures are not fatal.
+func readSettingForDisplay(client *adb.Client, serial, namespace, key string) string {
+	out, err := client.Exec("-s", serial, "shell", "settings", "get", namespace, key)
+	if err != nil {
+		return ""
+	}
+	return out
 }
 
 func handleInstallShim(args []string) {
@@ -797,7 +1030,12 @@ func handleInstallShim(args []string) {
 
 	fmt.Println("✅ Successfully installed emulator shim!")
 	fmt.Println("   • From now on, launching emulators via Android Studio 'Play' button")
-	fmt.Println("     will automatically inject -memory 1024 -lowram -no-audio flags.")
+	fmt.Printf("     will automatically inject -memory %d -lowram -no-audio flags.\n", ramMb)
+	fmt.Println("   • It replaces the SDK's emulator binary, backing the original up as")
+	fmt.Println("     emulator.real. If sdkmanager later updates the emulator package,")
+	fmt.Println("     re-run install-shim to re-wrap the new binary.")
+	fmt.Println("   • If a golden snapshot exists, launches boot it and DISCARD state on")
+	fmt.Println("     exit. The shim prints a notice when it does this.")
 	fmt.Println("   • To restore stock Android Studio emulator behavior anytime:")
 	fmt.Println("     avdslim uninstall-shim")
 	fmt.Println()
@@ -824,24 +1062,16 @@ func handleBake(client *adb.Client, args []string) {
 	installed := config.GetInstalledAvds()
 	var targetAvd string
 	ramMb := 1024
-	aggressive := false
 	headless := false
-	var keepPackages []string
+	opts := parseSlimOptions(args)
 
 	for _, a := range args {
 		if strings.HasPrefix(a, "--ram=") {
 			if v, err := strconv.Atoi(strings.TrimPrefix(a, "--ram=")); err == nil {
 				ramMb = v
 			}
-		} else if a == "--aggressive" {
-			aggressive = true
 		} else if a == "--headless" || a == "--no-window" {
 			headless = true
-		} else if strings.HasPrefix(a, "--keep=") {
-			pkg := strings.TrimPrefix(a, "--keep=")
-			if pkg != "" {
-				keepPackages = append(keepPackages, pkg)
-			}
 		} else if !strings.HasPrefix(a, "--") {
 			targetAvd = a
 		}
@@ -867,23 +1097,27 @@ func handleBake(client *adb.Client, args []string) {
 	fmt.Printf("🍳 Baking Golden Snapshot for %q (RAM: %d MB)...\n", targetAvd, ramMb)
 	fmt.Println("   • Cold boots emulator in pristine state")
 	fmt.Println("   • Automatically prunes background bloatware & optimizes settings")
-	fmt.Println("   • Captures 'avdslim_clean' snapshot for instant ~1.5s launches")
+	fmt.Println("   • Captures an 'avdslim_clean' snapshot to resume from later")
 	fmt.Println()
 
 	// 1. Check if an emulator for this AVD is already running. If so, kill it to ensure cold boot.
 	running, _ := client.GetRunningEmulators()
 	for _, emu := range running {
-		nameOut, _ := client.Exec("-s", emu.Serial, "emu", "avd", "name")
-		if strings.Contains(nameOut, targetAvd) {
+		if client.IsAvd(emu.Serial, targetAvd) {
 			fmt.Printf("🔄 Stopping active emulator instance (%s) for clean baking...\n", emu.Serial)
 			client.Exec("-s", emu.Serial, "emu", "kill")
 			time.Sleep(2 * time.Second)
 		}
 	}
 
-	// Clean existing snapshot directory
-	home, _ := os.UserHomeDir()
-	snapDir := filepath.Join(home, ".android", "avd", targetAvd+".avd", "snapshots", "avdslim_clean")
+	// Clean only avdslim's own golden snapshot, which we are about to replace.
+	// Scoped to that one directory, never the whole snapshots/ tree, and the
+	// AVD name is validated before it becomes a path.
+	snapDir, err := config.SnapshotDir(targetAvd, config.GoldenSnapshotName)
+	if err != nil {
+		fmt.Printf("❌ %v\n", err)
+		return
+	}
 	_ = os.RemoveAll(snapDir)
 
 	// 2. Launch cold emulator (DO NOT pass -no-snapshot-save, DO pass -no-snapshot-load)
@@ -912,28 +1146,22 @@ func handleBake(client *adb.Client, args []string) {
 	}
 
 	fmt.Printf("✓ Emulator spawned (PID: %d). Waiting for boot completion...\n", cmd.Process.Pid)
-	_, _ = client.Exec("wait-for-device")
 
+	// No bare `adb wait-for-device` here: without -s it waits for *any* device, so
+	// it returns instantly when an unrelated emulator is already running, and it
+	// can block for the full blocking timeout when none appears. The loop below
+	// identifies this AVD's own serial and is bounded at 180s.
 	// Wait for sys.boot_completed
+	const bakeBootTimeout = 180 * time.Second
+	bakeDeadline := time.Now().Add(bakeBootTimeout)
+
 	var targetSerial string
 	booted := false
-	for i := 0; i < 90; i++ {
-		currentRunning, _ := client.GetRunningEmulators()
-		for _, emu := range currentRunning {
-			nameOut, _ := client.Exec("-s", emu.Serial, "emu", "avd", "name")
-			if strings.Contains(nameOut, targetAvd) {
-				targetSerial = emu.Serial
-				break
-			}
+	for time.Now().Before(bakeDeadline) {
+		if targetSerial == "" {
+			targetSerial = findSerialForAvd(client, targetAvd)
 		}
 		if targetSerial != "" {
-			res, _ := client.Exec("-s", targetSerial, "shell", "getprop", "sys.boot_completed")
-			if strings.TrimSpace(res) == "1" {
-				booted = true
-				break
-			}
-		} else if len(currentRunning) == 1 {
-			targetSerial = currentRunning[0].Serial
 			res, _ := client.Exec("-s", targetSerial, "shell", "getprop", "sys.boot_completed")
 			if strings.TrimSpace(res) == "1" {
 				booted = true
@@ -956,7 +1184,7 @@ func handleBake(client *adb.Client, args []string) {
 
 	// 3. Apply avdslim optimizations
 	fmt.Println("⚡ Pruning bloatware & tuning runtime settings...")
-	count, err := client.Slim(targetSerial, aggressive, keepPackages)
+	count, err := client.Slim(targetSerial, opts)
 	if err != nil {
 		fmt.Printf("⚠️  Warning during slim: %v\n", err)
 	} else {
@@ -986,20 +1214,20 @@ func handleBake(client *adb.Client, args []string) {
 	fmt.Println("🛑 Gracefully shutting down baking emulator...")
 	client.Exec("-s", targetSerial, "emu", "kill")
 
-	for i := 0; i < 10; i++ {
-		time.Sleep(1 * time.Second)
-		if pid := host.FindHostPidForSerial(targetSerial); pid == 0 {
-			break
-		}
+	if waitForEmulatorGone(client, targetSerial, 15*time.Second) {
+		fmt.Println("✓ Emulator shut down cleanly.")
+	} else {
+		fmt.Printf("⚠️  %s is still listed by adb after 15s.\n", targetSerial)
 	}
-	fmt.Println("✓ Emulator shut down cleanly.")
 
 	fmt.Println()
 	fmt.Println("════════════════════════════════════════════════════════════════════════")
 	fmt.Printf(" 🎉 Golden Snapshot Baked Successfully for %s!\n", targetAvd)
 	fmt.Println("════════════════════════════════════════════════════════════════════════")
 	fmt.Println(" • Snapshot Name: 'avdslim_clean'")
-	fmt.Println(" • Startup Latency: Reduced from ~45s cold boot to <1.5s instant restore ⚡")
+	fmt.Println(" • Startup: resumes the saved RAM image instead of cold-booting Android.")
+	fmt.Println("   The snapshot load is a second or two; `avdslim start` end-to-end is")
+	fmt.Println("   longer, since it also waits for boot_completed and re-applies slimming.")
 	fmt.Printf(" • RAM Allocation: %d MB (-lowram)\n", ramMb)
 	fmt.Println(" • How to launch:")
 	fmt.Printf("     avdslim start %s\n", targetAvd)
@@ -1011,29 +1239,28 @@ func handleBake(client *adb.Client, args []string) {
 func handleSnapshot(client *adb.Client, args []string) {
 	var serial string
 	skipSlim := false
-	aggressive := false
-	snapName := "avdslim_clean"
-	var keepPackages []string
+	snapName := config.GoldenSnapshotName
+	opts := parseSlimOptions(args)
 
 	for _, a := range args {
 		if a == "--skip-slim" || a == "--no-prune" {
 			skipSlim = true
-		} else if a == "--aggressive" {
-			aggressive = true
 		} else if a == "--live" || a == "--current" {
 			// standard flag alias, ignore
 		} else if strings.HasPrefix(a, "--tag=") {
 			snapName = strings.TrimPrefix(a, "--tag=")
 		} else if strings.HasPrefix(a, "--name=") {
 			snapName = strings.TrimPrefix(a, "--name=")
-		} else if strings.HasPrefix(a, "--keep=") {
-			pkg := strings.TrimPrefix(a, "--keep=")
-			if pkg != "" {
-				keepPackages = append(keepPackages, pkg)
-			}
 		} else if !strings.HasPrefix(a, "--") {
 			serial = a
 		}
+	}
+
+	// snapName is user-supplied via --tag=/--name= and ends up both as a
+	// directory name and as an argument to the emulator console.
+	if err := config.ValidateSnapshotName(snapName); err != nil {
+		fmt.Printf("❌ %v\n", err)
+		return
 	}
 
 	running, err := client.GetRunningEmulators()
@@ -1057,13 +1284,8 @@ func handleSnapshot(client *adb.Client, args []string) {
 	}
 
 	// Get AVD Name
-	avdNameOut, _ := client.Exec("-s", serial, "emu", "avd", "name")
-	lines := strings.Split(strings.TrimSpace(avdNameOut), "\n")
-	avdName := ""
-	if len(lines) > 0 {
-		avdName = strings.TrimSpace(lines[0])
-	}
-	if avdName == "" || strings.Contains(avdName, "KO:") {
+	avdName, _ := client.GetAvdName(serial)
+	if avdName == "" {
 		installed := config.GetInstalledAvds()
 		if len(installed) == 1 {
 			avdName = installed[0]["name"]
@@ -1073,7 +1295,7 @@ func handleSnapshot(client *adb.Client, args []string) {
 	fmt.Printf("📸 Capturing Golden Snapshot from live emulator %s (%s)...\n", serial, avdName)
 	if !skipSlim {
 		fmt.Println("⚡ Trimming background daemons and caches while preserving installed apps...")
-		count, _ := client.Slim(serial, aggressive, keepPackages)
+		count, _ := client.Slim(serial, opts)
 		fmt.Printf("✓ Trimmed memory and disabled %d background bloat packages.\n", count)
 	}
 
@@ -1096,7 +1318,7 @@ func handleSnapshot(client *adb.Client, args []string) {
 	fmt.Printf(" • Snapshot Name: %q\n", snapName)
 	fmt.Println(" • Preserved: All installed apps, local databases & logged-in accounts")
 	fmt.Println(" • Instant Restore: Next time you launch with `avdslim start` or Android Studio,")
-	fmt.Println("   it will boot into this exact configured state in < 1.5 seconds! ⚡")
+	fmt.Println("   it will resume this exact configured state instead of cold-booting.")
 	fmt.Println(" • The running emulator remains active for your current work.")
 	fmt.Println("════════════════════════════════════════════════════════════════════════")
 	fmt.Println()
@@ -1128,9 +1350,15 @@ func handleUnbake(args []string) {
 		return
 	}
 
-	home, _ := os.UserHomeDir()
-	snapDir := filepath.Join(home, ".android", "avd", targetAvd+".avd", "snapshots", "avdslim_clean")
-	if _, err := os.Stat(snapDir); os.IsNotExist(err) {
+	// targetAvd comes straight from argv, so validate it before it reaches
+	// os.RemoveAll. `avdslim unbake ../../../../tmp/x` previously resolved
+	// outside the AVD tree entirely.
+	snapDir, err := config.SnapshotDir(targetAvd, config.GoldenSnapshotName)
+	if err != nil {
+		fmt.Printf("❌ %v\n", err)
+		return
+	}
+	if _, statErr := os.Stat(snapDir); os.IsNotExist(statErr) {
 		fmt.Printf("ℹ️  No Golden Snapshot found for %s.\n", targetAvd)
 		return
 	}
@@ -1144,4 +1372,3 @@ func handleUnbake(args []string) {
 	fmt.Println("   Subsequent launches will perform standard boots.")
 	fmt.Println()
 }
-

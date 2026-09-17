@@ -47,8 +47,11 @@ stay independent of device state.
 ## Invariants
 
 - Stdlib only (`go.mod` has zero requires). Do not add dependencies.
-- `go.mod` module path is `github.com/krunalbhalala/avdslim` but the GitHub
-  remote is `kdbhalala/avdslim` — keep import paths as-is, don't "fix" them.
+- `go.mod` module path must match the GitHub remote: `github.com/kdbhalala/avdslim`.
+  It previously declared `github.com/krunalbhalala/avdslim`, an account that does
+  not exist on GitHub — which broke `go install` and left the import path every
+  source file references claimable by anyone who registers that username. Keep the
+  module path and the remote in sync.
 - PID detection must exclude own process: filter `avdslim`, `crashpad`,
   `netsimd` and skip `os.Getpid()` or `measure` reports its own 5 MB RSS.
 - `launch`/`bake` must pass `-no-snapshot-load` (cold) vs

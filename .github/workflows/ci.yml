@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Vet, test & cross-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.22'
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race -count=1 ./...
+
+      - name: Cross-build every release target
+        run: |
+          set -euo pipefail
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64; do
+            echo "building $target"
+            CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" \
+              go build -trimpath -o /dev/null ./cmd/avdslim
+          done
+
+      # Regression guard: `version` must stay a string *var*. As a const, the
+      # linker silently ignores -X and every release reports the hardcoded
+      # version regardless of its tag.
+      - name: Version injection must work
+        run: |
+          set -euo pipefail
+          go build -ldflags="-X main.version=9.9.9-citest" -o /tmp/avdslim ./cmd/avdslim
+          got="$(/tmp/avdslim version)"
+          echo "reported: $got"
+          if ! printf '%s' "$got" | grep -q '9\.9\.9-citest'; then
+            echo "::error::-X main.version was ignored; is 'version' a const instead of a var?"
+            exit 1
+          fi
+
+      # The release version lives in four hand-edited places. Catch drift here
+      # rather than shipping a binary whose reported version disagrees with the
+      # tarball name the installer looks for.
+      - name: Version strings agree
+        run: |
+          set -euo pipefail
+          mk="$(sed -n 's/^VERSION=\(.*\)$/\1/p' Makefile | head -n1)"
+          go_default="$(sed -n 's/^var version = "\(.*\)"$/\1/p' cmd/avdslim/main.go | head -n1)"
+          sh="$(sed -n 's/^VERSION="\${AVDSLIM_VERSION:-v\(.*\)}"$/\1/p' install.sh | head -n1)"
+          formula="$(sed -n 's/^  version "\(.*\)"$/\1/p' Formula/avdslim.rb | head -n1)"
+          act="$(sed -n "s/^    default: 'v\(.*\)'$/\1/p" action.yml | head -n1)"
+
+          echo "Makefile=$mk go=$go_default install.sh=$sh formula=$formula action.yml=$act"
+          fail=0
+          for pair in "go:$go_default" "install.sh:$sh" "formula:$formula" "action.yml:$act"; do
+            name="${pair%%:*}"; val="${pair#*:}"
+            if [ -z "$val" ]; then
+              echo "::error::could not parse a version from $name"; fail=1; continue
+            fi
+            if [ "$val" != "$mk" ]; then
+              echo "::error::$name version '$val' != Makefile version '$mk'"; fail=1
+            fi
+          done
+          exit "$fail"
+
+  shellcheck:
+    name: shellcheck install.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: shellcheck install.sh scripts/monitor-pull.sh scripts/test-checksum-lookup.sh
+
+      # Guards the contract between the checksums.txt release.yml writes and the
+      # filename column install.sh matches against. A "./" prefix once made every
+      # lookup miss, which would have refused to install every future release.
+      - name: checksums.txt / install.sh contract
+        run: ./scripts/test-checksum-lookup.sh

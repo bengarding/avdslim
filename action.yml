@@ -6,45 +6,60 @@ branding:
   color: 'green'
 
 inputs:
+  version:
+    description: 'avdslim release tag to install. Pin this in production.'
+    required: false
+    default: 'v1.0.5'
   ram:
     description: 'Target RAM allocation in MB (default: 1024)'
     required: false
     default: '1024'
   install-shim:
-    description: 'Transparently wrap Android SDK emulator binary so all CI scripts/Gradle tasks run slimmed'
+    description: >-
+      Transparently wrap the Android SDK emulator binary so all CI scripts/Gradle
+      tasks run slimmed. NOTE: this mutates the SDK in place. On a self-hosted or
+      otherwise persistent runner the change outlives the job and affects every
+      later build on that machine — set this to false there.
     required: false
     default: 'true'
   watch:
-    description: 'Start background watcher daemon to auto-prune bloatware upon boot'
+    description: >-
+      Start a background watcher that auto-prunes bloatware from every emulator
+      that boots during this job — including emulators under test. This changes
+      the environment your tests run in; leave it off unless that is what you want.
     required: false
     default: 'false'
 
 runs:
   using: 'composite'
   steps:
-    - name: Download & Install AVD-SLIM
+    # The installer ships with the action, so it is resolved at whatever ref the
+    # caller pinned (tag or SHA) instead of being fetched from a mutable branch.
+    # install.sh verifies the release tarball's SHA-256 against the checksums.txt
+    # published in the same release before extracting anything.
+    - name: Install AVD-SLIM
       shell: bash
+      env:
+        AVDSLIM_VERSION: ${{ inputs.version }}
+        AVDSLIM_INSTALL_DIR: ${{ runner.temp }}/avdslim/bin
       run: |
-        echo "⚡ Installing AVD-SLIM on CI runner..."
-        if command -v avdslim >/dev/null 2>&1; then
-          echo "avdslim already installed: $(avdslim version)"
-        else
-          curl -fsSL https://raw.githubusercontent.com/kdbhalala/avdslim/main/install.sh | bash
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-          export PATH="$HOME/.local/bin:$PATH"
-        fi
+        set -euo pipefail
+        bash "$GITHUB_ACTION_PATH/install.sh"
+        echo "$AVDSLIM_INSTALL_DIR" >> "$GITHUB_PATH"
 
     - name: Configure Emulator Shim
       if: inputs.install-shim == 'true'
       shell: bash
+      env:
+        RAM_MB: ${{ inputs.ram }}
       run: |
-        export PATH="$HOME/.local/bin:$PATH"
-        avdslim install-shim --ram=${{ inputs.ram }}
+        set -euo pipefail
+        avdslim install-shim --ram="$RAM_MB"
 
     - name: Start AVD-SLIM Watcher
       if: inputs.watch == 'true'
       shell: bash
       run: |
-        export PATH="$HOME/.local/bin:$PATH"
-        nohup avdslim watch > /tmp/avdslim-watch.log 2>&1 &
+        set -euo pipefail
+        nohup avdslim watch > "$RUNNER_TEMP/avdslim-watch.log" 2>&1 &
         echo "👀 AVD-SLIM Watcher active in background."

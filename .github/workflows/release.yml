@@ -40,8 +40,11 @@ jobs:
           set -euo pipefail
           mkdir -p dist
 
-          # GITHUB_REF_NAME is read as an env var rather than interpolated via
-          # ${{ }}, so its contents cannot break out into this shell script.
+          # GITHUB_REF_NAME is read as a shell env var rather than through GitHub
+          # expression interpolation, so its contents cannot break out into this
+          # script. (Do not write the interpolation syntax literally anywhere in a
+          # run block, even in a comment: GitHub parses it there too, and an empty
+          # expression makes the whole workflow file invalid.)
           VERSION="${GITHUB_REF_NAME}"
 
           PLATFORMS=(

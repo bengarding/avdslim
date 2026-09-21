@@ -15,6 +15,12 @@ permissions: {}
 jobs:
   collect-stats:
     name: Collect & Archive Repository Stats
+    # Never run in a fork. This collects traffic analytics about the upstream
+    # repository, which requires a PAT with repo scope that no fork has — the
+    # default GITHUB_TOKEN gets 403 "Resource not accessible by integration" from
+    # the traffic API. Without this guard the nightly cron fails in every fork,
+    # every night, emailing the fork owner about a job that can never succeed.
+    if: github.repository == 'kdbhalala/avdslim'
     runs-on: ubuntu-latest
     permissions:
       contents: write  # pushes collected stats to the databranch

@@ -35,6 +35,17 @@ jobs:
             exit 1
           fi
 
+      # A workflow file with an invalid expression is a *startup* failure: it is
+      # accepted on merge and then fails on every push, with no job log. Exactly
+      # that shipped here — a literal interpolation written inside a run-block
+      # comment silently invalidated release.yml. Validate the files in CI.
+      - name: actionlint
+        run: |
+          # SC2016 is ignored: it flags '$' inside the single-quoted sed scripts
+          # below, where '$' is an end-of-line anchor rather than an expansion.
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 \
+            -ignore 'SC2016' .github/workflows/*.yml
+
       - name: go vet
         run: go vet ./...
 
